@@ -17,8 +17,8 @@ use std::rc::Rc;
 use mlua::{IntoLua, Lua, LuaSerdeExt, Table, Value};
 use tracing::{error, info};
 
-use paneru_lua as shared;
-use paneru_shared_types::script_state::{ScriptStateWrite, WriteOutcome};
+use super::shared;
+use crate::types::script_state::{ScriptStateWrite, WriteOutcome};
 
 use super::convert::LuaEvent;
 use super::runtime::{
@@ -28,7 +28,7 @@ use super::world::DispatchWorld;
 use crate::commands::Command;
 use crate::config::{Config, config_from_lua, resolve_chord};
 use crate::ecs::state::StateQueryKind;
-use paneru_shared_types::windowset_lua::returned_ops;
+use crate::types::windowset_lua::returned_ops;
 
 /// One `paneru.exec` call: what to run, and where the answer goes.
 struct ExecJob {
@@ -390,6 +390,13 @@ pub(super) fn install(
     };
     paneru.set("windows", windows)?;
 
+    // The embedded runtime already has the full API. Let scripts use the
+    // conventional `local paneru = require("paneru")` form without looking for
+    // the separately built client extension (`paneru.so`).
+    let package: Table = lua.globals().get("package")?;
+    let loaded: Table = package.get("loaded")?;
+    loaded.set("paneru", paneru)?;
+
     Ok(())
 }
 
@@ -734,6 +741,9 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
         fingers_count: _,
         direction: _,
         vertical: _,
+        paging: _,
+        page_distance_cm: _,
+        haptics: _,
     } = GestureOptions::default();
     let gesture = lua.create_table()?;
     gesture.set("fingers_count", config.swipe_gesture_fingers())?;
@@ -743,6 +753,9 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
     };
     gesture.set("direction", direction_str)?;
     gesture.set("vertical", config.swipe_vertical())?;
+    gesture.set("paging", config.swipe_gesture_paging())?;
+    gesture.set("page_distance_cm", config.swipe_gesture_page_distance_cm())?;
+    gesture.set("haptics", config.swipe_gesture_haptics())?;
     swipe.set("gesture", gesture)?;
 
     let ScrollOptions {
@@ -765,6 +778,9 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
     let decorations = lua.create_table()?;
     decorations.set("workspace_menu_status", config.workspace_menu_status())?;
     decorations.set("workspace_popup_status", config.workspace_popup_status())?;
+    let menu = lua.create_table()?;
+    menu.set("enabled", config.menubar_enabled())?;
+    decorations.set("menu", menu)?;
 
     let active = lua.create_table()?;
     let border = lua.create_table()?;
@@ -880,6 +896,9 @@ mod tests {
 
             [swipe.gesture]
             fingers_count = 3
+            paging = true
+            page_distance_cm = 3.0
+            haptics = false
 
             [swipe.scroll]
             modifier = "alt"
@@ -930,6 +949,9 @@ mod tests {
                 "GestureOptions field '{field}' is missing from paneru.config.swipe.gesture!"
             );
         }
+        assert!(gesture_table.get::<bool>("paging").unwrap());
+        assert_eq!(gesture_table.get::<f64>("page_distance_cm").unwrap(), 3.0);
+        assert!(!gesture_table.get::<bool>("haptics").unwrap());
 
         let scroll_table: Table = swipe_table.get("scroll").unwrap();
         for field in struct_field_names::<ScrollOptions>() {
@@ -948,5 +970,11 @@ mod tests {
                 "RestoreOptions field '{field}' is missing from paneru.config.restore!"
             );
         }
+        let defaults = config_to_lua_table(&lua, &Config::default()).unwrap();
+        let swipe: Table = defaults.get("swipe").unwrap();
+        let gesture: Table = swipe.get("gesture").unwrap();
+        assert!(!gesture.get::<bool>("paging").unwrap());
+        assert_eq!(gesture.get::<f64>("page_distance_cm").unwrap(), 2.0);
+        assert!(gesture.get::<bool>("haptics").unwrap());
     }
 }

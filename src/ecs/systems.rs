@@ -14,7 +14,7 @@ use bevy::time::Time;
 use objc2_foundation::NSPoint;
 use std::collections::HashSet;
 use std::pin::Pin;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
@@ -30,7 +30,8 @@ use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
     LowPowerMode, MissionControlActive, Position, ReadDisplayProperties, RestoreWindowState,
-    Scrolling, SendMessageTrigger, SpawnCommandsExt, Unmanaged, WidthRatio, WindowProperties,
+    Scrolling, SendMessageTrigger, SpawnCommandsExt, SystemTheme, Unmanaged, WidthRatio,
+    WindowProperties,
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{
@@ -561,6 +562,16 @@ pub(super) fn retry_front_switch(
     }
 }
 
+/// Upper bound on the timestep fed into [`ease_out_factor`].
+///
+/// When the event loop wakes from an idle sleep (up to 500ms, or 2s in low
+/// power mode), `Time::delta_secs_f64()` reports the entire sleep duration on
+/// the wakeup frame. Feeding that straight into the exponential decay would
+/// consume almost the entire distance on Frame 0 and turn the animation into a
+/// single-frame jump. Cap each frame's step to a 30fps tick (matching the
+/// scroll integrator's `MAX_STEP_SECS`) so the wakeup frame steps smoothly.
+const MAX_ANIMATION_STEP_SECS: f64 = 1.0 / 30.0;
+
 /// Animates window movement.
 /// Fraction of the remaining distance an exponential ease-out consumes in a
 /// frame, given a decay `rate` (per second) and the frame's `delta` in seconds.
@@ -570,6 +581,7 @@ pub(super) fn retry_front_switch(
     reason = "clamped to [0, 1], well within f32's range; only sub-pixel precision is lost"
 )]
 fn ease_out_factor(rate: f64, delta: f64) -> f32 {
+    let delta = delta.min(MAX_ANIMATION_STEP_SECS);
     (1.0 - (-rate * delta).exp()).clamp(0.0, 1.0) as f32
 }
 
@@ -724,15 +736,11 @@ pub(crate) fn pump_events(
             break false;
         }
 
-        // Polled before any timed wait: the Cocoa pump above already did this
-        // frame's sleeping, so a quiet channel used to cost another millisecond.
-        let received = match incoming_events.try_recv() {
-            Err(TryRecvError::Empty) => incoming_events.recv_timeout(Duration::from_millis(1)),
-            Err(TryRecvError::Disconnected) => Err(RecvTimeoutError::Disconnected),
-            Ok(event) => Ok(event),
-        };
-        match received {
-            Ok(Event::Exit) | Err(RecvTimeoutError::Disconnected) => {
+        // Non-blocking drain: the Cocoa pump above already did this frame's
+        // sleeping, so an empty channel means we can proceed immediately
+        // without paying an extra millisecond of wait latency.
+        match incoming_events.try_recv() {
+            Ok(Event::Exit) | Err(TryRecvError::Disconnected) => {
                 exit.write(AppExit::Success);
                 return;
             }
@@ -746,7 +754,7 @@ pub(crate) fn pump_events(
                 }
                 *timeout = LOOP_TIMEOUT_STEP;
             }
-            Err(RecvTimeoutError::Timeout) => break true,
+            Err(TryRecvError::Empty) => break true,
         }
     };
 
@@ -988,14 +996,13 @@ pub(super) struct OverlayWindowConfigCache {
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn update_overlays(
-    // Gating lives in the `overlay_dirty` run condition (strip change *or*
-    // focus change); this query just resolves the current active workspace.
     active_workspace: Populated<(Has<Scrolling>, &LayoutStrip), With<ActiveWorkspaceMarker>>,
     windows: Windows,
     applications: Query<&Application>,
     overlay_mgr: Option<NonSendMut<OverlayManager>>,
     mission_control_active: Res<MissionControlActive>,
     config: Res<Config>,
+    theme: Option<Res<SystemTheme>>,
     mut window_config_cache: Local<OverlayWindowConfigCache>,
     window_manager: Res<WindowManager>,
 ) {
@@ -1080,7 +1087,7 @@ pub(super) fn update_overlays(
         };
 
         Some(BorderParams {
-            color: config.border_color(),
+            color: config.border_color(theme.is_some_and(|theme| theme.is_dark)),
             opacity: config.border_opacity(),
             width: config.border_width(),
             radius: window_config_cache
