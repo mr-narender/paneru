@@ -33,8 +33,8 @@ use crate::commands::Command;
 use crate::config::Config;
 use crate::ecs::state::PaneruQueryState;
 use crate::platform::input::set_lua_keybinds;
-use paneru_shared_types::script_state::{ScriptState, ScriptStateWrite, WriteOutcome};
-use paneru_shared_types::windowset::WindowSet;
+use crate::types::script_state::{ScriptState, ScriptStateWrite, WriteOutcome};
+use crate::types::windowset::WindowSet;
 
 /// How long [`Drop`] waits for an in-flight dispatch to finish before giving
 /// up and detaching the thread. Bounded, so a script stuck in a loop can
@@ -498,7 +498,7 @@ mod tests {
     use super::*;
     use crate::ecs::state::{PaneruActiveState, PaneruVirtualWorkspaceState, PaneruWindowState};
     use crate::lua::convert::WindowSpawnPayload;
-    use paneru_shared_types::windowset::{LayoutOp, WinID};
+    use crate::types::windowset::{LayoutOp, WinID};
 
     /// How long a test waits for the worker before calling it wedged. Generous:
     /// it only ever elapses on failure.
@@ -634,6 +634,8 @@ mod tests {
                     bundle_id: "com.example.app".to_string(),
                     app_name: "Test App".to_string(),
                     title: "window".to_string(),
+                    role: Some("AXWindow".to_string()),
+                    subrole: Some("AXStandardWindow".to_string()),
                     focused: true,
                     floating: false,
                     display_id: Some(1),
@@ -811,7 +813,7 @@ mod tests {
     /// A layout built from `(id, app, workspace)` triples, over workspaces 1
     /// (on screen) and 9 (the stash). Each window gets a column of its own.
     fn layout(windows: &[(WinID, &str, u32)]) -> WindowSet {
-        use paneru_shared_types::state::Frame;
+        use crate::types::state::Frame;
 
         layout_on(
             1,
@@ -829,10 +831,10 @@ mod tests {
     /// proportional placement has to be resolved against.
     fn layout_on(
         display_id: u32,
-        display_frame: paneru_shared_types::state::Frame,
+        display_frame: crate::types::state::Frame,
         windows: &[(WinID, &str, u32)],
     ) -> WindowSet {
-        use paneru_shared_types::windowset::{ColumnSet, DisplaySet, WindowRec, WorkspaceSet};
+        use crate::types::windowset::{ColumnSet, DisplaySet, WindowRec, WorkspaceSet};
 
         let workspaces = [1, 9]
             .map(|number| WorkspaceSet {
@@ -850,6 +852,8 @@ mod tests {
                                     app_name: (*app).to_string(),
                                     bundle_id: format!("com.example.{app}"),
                                     title: format!("{app} window"),
+                                    role: Some("AXWindow".to_string()),
+                                    subrole: Some("AXStandardWindow".to_string()),
                                     frame: None,
                                     floating: false,
                                     managed: true,
@@ -905,14 +909,16 @@ mod tests {
     /// record an op — and a set handed to a handler has asked for nothing yet,
     /// which is what the real extractor produces.
     fn test_window_set_on(holding: u32) -> WindowSet {
-        use paneru_shared_types::state::Frame;
-        use paneru_shared_types::windowset::{ColumnSet, DisplaySet, WindowRec, WorkspaceSet};
+        use crate::types::state::Frame;
+        use crate::types::windowset::{ColumnSet, DisplaySet, WindowRec, WorkspaceSet};
 
         let window = WindowRec {
             id: 7,
             app_name: "Test App".to_string(),
             bundle_id: "com.example.app".to_string(),
             title: "window".to_string(),
+            role: Some("AXWindow".to_string()),
+            subrole: Some("AXStandardWindow".to_string()),
             frame: None,
             floating: false,
             managed: true,
@@ -1443,7 +1449,7 @@ mod tests {
                 // 0.1/0.05/0.8/0.5 of the fixture's 1920x1080 display.
                 LayoutOp::SetFrame {
                     window: 7,
-                    frame: paneru_shared_types::state::Frame {
+                    frame: crate::types::state::Frame {
                         x: 192,
                         y: 54,
                         width: 1536,
@@ -1480,7 +1486,7 @@ mod tests {
             &worker,
             layout_on(
                 2,
-                paneru_shared_types::state::Frame {
+                crate::types::state::Frame {
                     x: 1920,
                     y: -200,
                     width: 1280,
@@ -1500,7 +1506,7 @@ mod tests {
                 // 0.1/0.05/0.8/0.5 of 1280x800, offset by the display origin.
                 LayoutOp::SetFrame {
                     window: 7,
-                    frame: paneru_shared_types::state::Frame {
+                    frame: crate::types::state::Frame {
                         x: 2048,
                         y: -160,
                         width: 1024,
@@ -1605,7 +1611,9 @@ mod tests {
             app_name: "Ghostty".into(),
             bundle_id: "com.mitchellh.ghostty".into(),
             title: "Terminal".into(),
-            frame: paneru_shared_types::state::Frame {
+            role: None,
+            subrole: None,
+            frame: crate::types::state::Frame {
                 x: 0,
                 y: 0,
                 width: 800,
@@ -1636,7 +1644,9 @@ mod tests {
             app_name: "Ghostty".into(),
             bundle_id: "com.mitchellh.ghostty".into(),
             title: "Terminal".into(),
-            frame: paneru_shared_types::state::Frame {
+            role: None,
+            subrole: None,
+            frame: crate::types::state::Frame {
                 x: 0,
                 y: 0,
                 width: 800,
@@ -1651,7 +1661,9 @@ mod tests {
             app_name: "LibreOffice".into(),
             bundle_id: "org.libreoffice.script".into(),
             title: "Document".into(),
-            frame: paneru_shared_types::state::Frame {
+            role: None,
+            subrole: None,
+            frame: crate::types::state::Frame {
                 x: 0,
                 y: 0,
                 width: 300,
@@ -1670,6 +1682,29 @@ mod tests {
         assert_eq!(
             next_flash(&worker, "libreoffice match"),
             "matched:LibreOffice"
+        );
+    }
+
+    #[test]
+    fn window_set_records_expose_role_and_subrole_and_match_on_them() {
+        let worker = worker(
+            r#"
+            local is_standard = paneru.match{ role = "AXWindow", subrole = "AXStandardWindow" }
+            local is_dialog = paneru.match{ subrole = "AXDialog" }
+            paneru.bind("alt - r", function(ws)
+                local win = ws:find(is_standard)
+                if win and not ws:find(is_dialog) then
+                    paneru.flash(win.role .. "/" .. win.subrole)
+                end
+            end)
+            "#,
+        );
+
+        worker.send_binds(vec![1]);
+        serve(&worker, test_window_set_on(1));
+        assert_eq!(
+            next_flash(&worker, "window_set role/subrole"),
+            "AXWindow/AXStandardWindow"
         );
     }
 }

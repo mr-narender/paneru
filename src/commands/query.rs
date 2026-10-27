@@ -19,7 +19,7 @@ use crate::ecs::state::{
 use crate::ecs::{ActiveWorkspaceMarker, FocusedMarker, Unmanaged};
 use crate::events::Event;
 use crate::platform::WinID;
-use paneru_shared_types::wire::{self, Response};
+use crate::types::wire::{self, Response};
 
 /// One connected `paneru subscribe` client.
 ///
@@ -193,10 +193,15 @@ pub(super) fn register_query_commands(app: &mut App) {
 
     app.init_resource::<StateSubscribers>();
     app.init_resource::<StateBroadcastCache>();
-    app.add_systems(PreUpdate, (state_subscribe_handler, state_query_handler));
+    app.add_systems(
+        PreUpdate,
+        (state_subscribe_handler, state_query_handler).in_set(crate::ecs::PreUpdateSet::Dispatch),
+    );
     app.add_systems(
         PostUpdate,
-        state_event_broadcast_handler.run_if(active_subscribers),
+        state_event_broadcast_handler
+            .in_set(crate::ecs::PostUpdateSet::Bookkeeping)
+            .run_if(active_subscribers),
     );
 }
 
@@ -480,6 +485,8 @@ mod tests {
                 bundle_id: bundle_id.to_string(),
                 app_name: "Test App".to_string(),
                 title: title.to_string(),
+                role: Some("AXWindow".to_string()),
+                subrole: Some("AXStandardWindow".to_string()),
                 focused: active.focused_window_id == Some(window_id),
                 floating: false,
                 display_id: Some(1),
@@ -549,7 +556,7 @@ mod tests {
             StateBroadcastSignals::default(),
         );
 
-        assert!(duplicate.is_empty());
+        assert_eq!(duplicate, []);
     }
 
     #[test]
@@ -591,7 +598,7 @@ mod tests {
         let duplicate =
             collect_state_broadcast_events(events.iter(), &state, &mut cache, |_| None, signals);
 
-        assert!(duplicate.is_empty());
+        assert_eq!(duplicate, []);
 
         let changed_state = query_state_with_active_window(
             26_261,
@@ -658,7 +665,7 @@ mod tests {
             |_| None,
             StateBroadcastSignals::default(),
         );
-        assert!(repeat.is_empty());
+        assert_eq!(repeat, []);
     }
 
     #[test]

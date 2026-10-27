@@ -21,7 +21,7 @@ use crate::ecs::params::Windows;
 use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, SelectedVirtualMarker, Unmanaged};
 use crate::manager::{Application, Display, WindowManager};
 use crate::platform::{Pid, ProcessSerialNumber, WinID, WorkspaceId};
-use paneru_shared_types::windowset::WindowSet;
+use crate::types::windowset::WindowSet;
 
 pub const STATE_FILE_NAME: &str = "state.json";
 const SUPPORTED_STATE_VERSION: u32 = 2;
@@ -97,7 +97,7 @@ pub struct SavedWindow {
 
 // These wire-format types live in the shared `paneru_shared_types` crate;
 // aliased here to the names the rest of the daemon already uses.
-pub use paneru_shared_types::state::{
+pub use crate::types::state::{
     ActiveState as PaneruActiveState, Frame, QueryState as PaneruQueryState, StateEvent,
     StateQueryKind, VirtualWorkspaceState as PaneruVirtualWorkspaceState,
     WindowState as PaneruWindowState,
@@ -458,8 +458,9 @@ impl QueryStateParams<'_, '_> {
 /// windows, this keeps the strip's column structure — needed for `ws:swap`,
 /// `ws:east`, `ws:stack` and friends to know what is beside what.
 impl QueryStateParams<'_, '_> {
+    #[allow(clippy::unnecessary_wraps)]
     pub fn extract_window_set(&self) -> crate::errors::Result<WindowSet> {
-        use paneru_shared_types::windowset::{ColumnSet, DisplaySet, WorkspaceSet};
+        use crate::types::windowset::{ColumnSet, DisplaySet, WorkspaceSet};
 
         let focused_entity = self.windows.focused().map(|(_, entity)| entity);
         let sliver_width = self.config.sliver_width();
@@ -470,17 +471,18 @@ impl QueryStateParams<'_, '_> {
 
         // Group the workspace strips by the display entity that owns them, so
         // each display can be built with its own workspaces in one pass.
+        let has_floating = has_floating_windows(&self.windows);
         let mut strips_by_display: HashMap<Entity, Vec<WorkspaceSet>> = HashMap::new();
         for (child, strip, active_workspace, selected_workspace) in self.workspaces {
             // Only ask for floating windows on a workspace that's actually
             // showing, since this read goes out to the window server.
-            let floating_entities = if active_workspace
-                || selected_workspace && active_workspace_id != Some(strip.id())
-            {
-                self.window_manager.windows_in_workspace(strip.id())?
-            } else {
-                Vec::new()
-            };
+            let query_space =
+                active_workspace || selected_workspace && active_workspace_id != Some(strip.id());
+            let floating_entities = untracked_floating_in_space(
+                &self.window_manager,
+                strip.id(),
+                has_floating && query_space,
+            );
 
             // A window stays tracked by the strip after it's floated (so it can
             // be re-tiled later), so it's the `Floating` marker — not strip
@@ -579,7 +581,7 @@ impl QueryStateParams<'_, '_> {
         entity: Entity,
         focused: Option<Entity>,
         sliver_width: i32,
-    ) -> Option<paneru_shared_types::windowset::WindowRec> {
+    ) -> Option<crate::types::windowset::WindowRec> {
         let (window, _, unmanaged) = self.windows.get_managed(entity)?;
         let (_, _, app_entity) = self.windows.find_parent(window.id())?;
         let app = self.apps.get(app_entity).ok()?;
@@ -591,11 +593,13 @@ impl QueryStateParams<'_, '_> {
             .and_then(|frame| window_visibility(frame, &self.displays, sliver_width))
             .is_some_and(|(_, visible)| visible && !hidden);
 
-        Some(paneru_shared_types::windowset::WindowRec {
+        Some(crate::types::windowset::WindowRec {
             id: window.id(),
             app_name: app.name().to_string(),
             bundle_id: app.bundle_id().unwrap_or_default().clone(),
             title: window.title().unwrap_or_default(),
+            role: window.role().ok(),
+            subrole: window.subrole().ok(),
             frame: frame.map(|frame| Frame {
                 x: frame.min.x,
                 y: frame.min.y,
@@ -610,9 +614,34 @@ impl QueryStateParams<'_, '_> {
     }
 }
 
+fn has_floating_windows(windows: &Windows) -> bool {
+    windows.iter().any(|(_, entity)| {
+        matches!(
+            windows.get_managed(entity),
+            Some((_, _, Some(Unmanaged::Floating)))
+        )
+    })
+}
+
+fn untracked_floating_in_space(
+    window_manager: &WindowManager,
+    workspace_id: WorkspaceId,
+    should_query: bool,
+) -> Vec<WinID> {
+    if !should_query {
+        return Vec::new();
+    }
+    window_manager
+        .windows_in_workspace(workspace_id)
+        .inspect_err(|err| {
+            debug!("unable to query windows on workspace {workspace_id}: {err}");
+        })
+        .unwrap_or_default()
+}
+
 /// How a layout column arranges its windows, in the vocabulary a script sees.
-fn column_kind(column: &Column) -> paneru_shared_types::windowset::ColumnKind {
-    use paneru_shared_types::windowset::ColumnKind;
+fn column_kind(column: &Column) -> crate::types::windowset::ColumnKind {
+    use crate::types::windowset::ColumnKind;
     match column {
         Column::Single(_) => ColumnKind::Single,
         Column::Stack(_) => ColumnKind::Stack,
@@ -642,7 +671,7 @@ pub trait QueryState: std::marker::Sized {
 /// A free function rather than an inherent method because [`PaneruQueryState`]
 /// belongs to the shared protocol crate, which knows nothing about the ECS.
 impl QueryState for PaneruQueryState {
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::unnecessary_wraps)]
     fn extract(
         workspaces: &Query<(
             &ChildOf,
@@ -673,14 +702,15 @@ impl QueryState for PaneruQueryState {
             ..PaneruActiveState::default()
         };
 
+        let has_floating = has_floating_windows(windows);
         for (child, strip, active_workspace, selected_workspace) in workspaces {
-            let floating = if active_workspace
-                || selected_workspace && active_workspace_id != Some(strip.id())
-            {
-                window_manager.windows_in_workspace(strip.id())?
-            } else {
-                Vec::new()
-            }
+            let query_space =
+                active_workspace || selected_workspace && active_workspace_id != Some(strip.id());
+            let floating = untracked_floating_in_space(
+                window_manager,
+                strip.id(),
+                has_floating && query_space,
+            )
             .into_iter()
             .filter_map(|window_id| {
                 let (_, entity) = windows.find(window_id)?;
@@ -712,6 +742,8 @@ impl QueryState for PaneruQueryState {
                         bundle_id,
                         app_name,
                         title,
+                        role: window.role().ok(),
+                        subrole: window.subrole().ok(),
                         focused: focused_entity == Some(entity),
                         floating: matches!(unmanaged, Some(Unmanaged::Floating)),
                         display_id: visibility.map(|(display_id, _)| display_id),
