@@ -17,9 +17,10 @@ use crate::ecs::params::{WindowCtx, Windows};
 use crate::ecs::state::{
     PaneruState, SavedColumn, SavedStackItem, SavedStrip, SavedWindow, SavedWorkspace,
 };
-use crate::ecs::workspace::PreviousStripPosition;
+use crate::ecs::workspace::{PreviousStripPosition, RestoredActivation};
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, RestoreWindowState, SpawnCommandsExt, Unmanaged,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, Position, RestoreWindowState,
+    SelectedVirtualMarker, SpawnCommandsExt, Unmanaged,
 };
 use crate::manager::{Application, Display, Window};
 use crate::platform::{Pid, WinID, WorkspaceId};
@@ -69,6 +70,8 @@ pub(crate) struct CurrentWindowIdentity {
     pub identifier: String,
     pub role: String,
     pub subrole: String,
+    /// Space of the strip holding the window at restore time; `None` when it is in no strip yet.
+    pub workspace_id: Option<WorkspaceId>,
 }
 
 impl CurrentWindowIdentity {
@@ -87,6 +90,7 @@ impl CurrentWindowIdentity {
             identifier: "main".to_string(),
             role: "AXWindow".to_string(),
             subrole: "AXStandardWindow".to_string(),
+            workspace_id: None,
         }
     }
 }
@@ -170,10 +174,16 @@ impl<'a> RestorePlanner<'a> {
         current: &[CurrentWindowIdentity],
         plan: &mut RestorePlan,
     ) -> Vec<PlannedStrip> {
+        // A window already on another Space stays there; unknown Space matches as before.
+        let on_workspace = current
+            .iter()
+            .filter(|w| w.workspace_id.is_none_or(|id| id == workspace.workspace_id))
+            .cloned()
+            .collect::<Vec<_>>();
         workspace
             .strips
             .iter()
-            .filter_map(|strip| self.plan_strip(workspace, strip, current, plan))
+            .filter_map(|strip| self.plan_strip(workspace, strip, &on_workspace, plan))
             .collect()
     }
 
@@ -432,7 +442,17 @@ pub(super) fn restore_window_state(
         restoration
     };
 
-    let current = current_window_identities(&ctx.windows, &apps, restoration);
+    let window_workspaces = workspaces
+        .iter()
+        .flat_map(|(_, strip, _, _)| {
+            let id = strip.id();
+            strip
+                .all_windows()
+                .into_iter()
+                .map(move |entity| (entity, id))
+        })
+        .collect::<HashMap<_, _>>();
+    let current = current_window_identities(&ctx.windows, &apps, restoration, &window_workspaces);
     let plan = RestorePlanner::new(restoration).plan(&current);
 
     if plan.consumed_entities.is_empty() {
@@ -528,23 +548,30 @@ pub(super) fn restore_window_state(
             .get(&planned.workspace_id)
             .is_some_and(|active| *active == planned.virtual_index);
         let is_global_active = is_active && active_workspace_ids.contains(&planned.workspace_id);
-        if is_active {
-            for (entity, strip, _, _) in &mut workspaces {
-                if strip.id() == planned.workspace_id
-                    && !emptied_existing_strips.contains(&entity)
-                    && is_global_active
-                    && let Ok(mut entity_commands) = ctx.commands.get_entity(entity)
-                {
-                    entity_commands.try_remove::<ActiveWorkspaceMarker>();
-                }
-            }
-        }
-
         let origin = if is_global_active {
             display.bounds().min
         } else {
             display.bounds().max - PARKED_STRIP_SLIVER
         };
+        if is_active {
+            let parked = display.bounds().max - PARKED_STRIP_SLIVER;
+            for (entity, strip, _, _) in &mut workspaces {
+                if strip.id() == planned.workspace_id
+                    && !emptied_existing_strips.contains(&entity)
+                    && let Ok(mut entity_commands) = ctx.commands.get_entity(entity)
+                {
+                    let existing_previous = PreviousStripPosition {
+                        origin: display.bounds().min,
+                        focus: strip.all_windows().first().copied(),
+                    };
+                    entity_commands
+                        .try_remove::<ActiveWorkspaceMarker>()
+                        .try_remove::<SelectedVirtualMarker>()
+                        .try_insert((Position(parked), existing_previous));
+                }
+            }
+        }
+
         let previous = PreviousStripPosition {
             origin: display.bounds().min,
             focus: strip.all_windows().first().copied(),
@@ -554,12 +581,18 @@ pub(super) fn restore_window_state(
             ctx.commands
                 .spawn_layout_strip(strip, origin, display_entity, is_global_active);
 
-        if !is_global_active {
+        if is_global_active {
+            spawned.insert(RestoredActivation);
+        } else {
+            if is_active {
+                spawned.insert(SelectedVirtualMarker);
+            } else {
+                spawned.remove::<SelectedVirtualMarker>();
+            }
             spawned.insert(previous);
         }
         restored_strips += 1;
     }
-
     info!(
         "Session restore applied: matched={}, strips={}, missing={}, ambiguous={}",
         plan.consumed_entities.len(),
@@ -585,6 +618,7 @@ fn current_window_identities(
     windows: &Windows,
     apps: &Query<&Application>,
     restoration: &PaneruState,
+    window_workspaces: &HashMap<Entity, WorkspaceId>,
 ) -> Vec<CurrentWindowIdentity> {
     let mut current = windows
         .managed_iter()
@@ -599,6 +633,7 @@ fn current_window_identities(
                 identifier: String::new(),
                 role: String::new(),
                 subrole: String::new(),
+                workspace_id: window_workspaces.get(&entity).copied(),
             })
         })
         .collect::<Vec<_>>();

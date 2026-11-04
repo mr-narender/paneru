@@ -32,6 +32,7 @@ pub use workspace::WorkspaceObserver;
 
 pub(crate) mod app_launcher;
 mod display;
+pub(crate) mod haptics;
 pub(crate) mod input;
 mod mission_control;
 pub mod notify;
@@ -300,7 +301,8 @@ impl PlatformCallbacks {
     ///
     /// # Returns
     ///
-    /// `Ok(())` if all handlers are set up successfully, otherwise `Err(Error)`.
+    /// Returns the shared input configuration when all handlers are set up successfully,
+    /// otherwise `Err(Error)`.
     ///
     /// # Side Effects
     ///
@@ -308,7 +310,7 @@ impl PlatformCallbacks {
     /// - Requests Accessibility permissions if not already granted.
     /// - Activates `CGEventTap`, `CGDisplayReconfigurationCallback`, `AXObserver` for Mission Control,
     ///   `NSWorkspace` observers, and Carbon process event handlers.
-    pub fn setup_handlers(&mut self) -> Result<()> {
+    pub fn setup_handlers(&mut self) -> Result<Config> {
         if !check_ax_privilege() {
             return Err(Error::PermissionDenied(
                 "Accessibility permissions are required. Please enable them in System Preferences -> Security & Privacy -> Privacy -> Accessibility.".to_string(),
@@ -324,7 +326,7 @@ impl PlatformCallbacks {
 
         let config = Config::load(CONFIGURATION_FILE.as_deref())?;
         self.events.send(Event::InitialConfig(config.clone()))?;
-        self.event_handler = Some(InputHandler::new(self.events.clone(), config).start()?);
+        self.event_handler = Some(InputHandler::new(self.events.clone(), config.clone()).start()?);
 
         self.notify_handler = Some(NotifyHandler::new(self.events.clone()).start()?);
         self.display_handler = Some(DisplayHandler::new(self.events.clone()).start()?);
@@ -334,7 +336,8 @@ impl PlatformCallbacks {
         self.mission_control_observer.observe()?;
         self.workspace_observer.start();
 
-        self.events.send(Event::ProcessesLoaded)
+        self.events.send(Event::ProcessesLoaded)?;
+        Ok(config)
     }
 
     /// Checks the input tap still delivers events and revives it when it does

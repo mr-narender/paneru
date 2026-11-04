@@ -3,10 +3,11 @@
     reason = "Bevy system and mlua callback signatures are by-value by contract"
 )]
 
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 mod accessibility_prompt;
@@ -26,6 +27,8 @@ mod platform;
 mod reader;
 mod util;
 
+pub use paneru::types;
+
 #[cfg(test)]
 mod tests;
 
@@ -36,17 +39,19 @@ use events::{Event, EventSender};
 use client::ClientCommand;
 use ecs::state::StateQueryKind;
 use errors::Result;
-use paneru_shared_types::script_state::ScriptStateWrite;
-use paneru_shared_types::script_value::ScriptValue;
-use paneru_shared_types::wire::ScriptStateRequest;
 use platform::service;
 use reader::CommandReader;
+use types::script_state::ScriptStateWrite;
+use types::script_value::ScriptValue;
+use types::wire::ScriptStateRequest;
 
 use crate::ecs::setup_bevy_app;
-use crate::manager::{check_ax_privilege, request_ax_privilege};
+use crate::manager::{check_ax_privilege, screen_is_locked};
 use crate::menubar::MenuBarManager;
 use crate::platform::PlatformCallbacks;
-use accessibility_prompt::{AccessibilitySetupAction, show_accessibility_setup};
+use accessibility_prompt::{
+    handle_accessibility_setup_action, permission_pane_name, show_accessibility_setup,
+};
 
 #[cfg(feature = "lua")]
 pub const VERSION_STRING: &str = concat!(
@@ -105,6 +110,10 @@ pub enum SubCmd {
 
     /// Restarts the `paneru` background service.
     Restart,
+
+    /// Shows the Paneru menu bar item and remembers the choice.
+    #[command(name = "showmenu")]
+    ShowMenu,
 
     /// Sends a command via a Unix socket to the running `paneru` daemon.
     SendCmd {
@@ -213,6 +222,9 @@ fn main() -> Result<()> {
             if !check_ax_privilege() && !wait_for_accessibility(sender.clone(), &receiver) {
                 return Ok(());
             }
+            if !wait_for_unlock(&receiver, screen_is_locked, Duration::from_millis(500)) {
+                return Ok(());
+            }
             match objc2::rc::autoreleasepool(|_| setup_bevy_app(sender, receiver)) {
                 Ok(mut app) => {
                     app.run();
@@ -233,6 +245,7 @@ fn main() -> Result<()> {
         SubCmd::Start => service()?.start()?,
         SubCmd::Stop => service()?.stop()?,
         SubCmd::Restart => service()?.restart()?,
+        SubCmd::ShowMenu => client::run(ClientCommand::Send(vec!["showmenu".to_string()]))?,
         SubCmd::SendCmd { cmd } => client::run(ClientCommand::Send(cmd))?,
         SubCmd::Query { query } => client::run(ClientCommand::Query(query.kind()))?,
         SubCmd::Subscribe { json: _ } => client::run(ClientCommand::Subscribe)?,
@@ -246,14 +259,12 @@ fn wait_for_accessibility(sender: EventSender, receiver: &Receiver<Event>) -> bo
     let _menu_bar =
         MenuBarManager::new_accessibility_required(platform_callbacks.main_thread_marker, sender);
 
-    if show_accessibility_setup(platform_callbacks.main_thread_marker)
-        == AccessibilitySetupAction::Continue
-    {
-        request_ax_privilege();
-    }
+    let action = show_accessibility_setup(platform_callbacks.main_thread_marker);
+    handle_accessibility_setup_action(action);
 
+    let pane = permission_pane_name();
     warn!(
-        "Accessibility access is required. Paneru will remain in the menu bar and start automatically once access is granted."
+        "{pane} permission is required. Paneru will remain in the menu bar and start automatically once access is granted."
     );
 
     loop {
@@ -271,13 +282,36 @@ fn wait_for_accessibility(sender: EventSender, receiver: &Receiver<Event>) -> bo
                 },
             )
             | Err(TryRecvError::Disconnected) => return false,
-            Ok(event) => warn!(
-                ?event,
-                "ignoring event while waiting for Accessibility access"
-            ),
+            Ok(event) => warn!(?event, pane, "ignoring event while waiting for permission"),
             Err(TryRecvError::Empty) => {}
         }
     }
+}
+
+/// Waits while `locked` says the screen is locked, as it is when the service
+/// restarts behind the lock screen: a scan then finds no windows, nothing scans
+/// again on unlock, and the session restore, matching none, would leave the
+/// saved layout to be overwritten by an empty one. `false` if asked to quit.
+fn wait_for_unlock(receiver: &Receiver<Event>, locked: impl Fn() -> bool, poll: Duration) -> bool {
+    if !locked() {
+        return true;
+    }
+    info!("The screen is locked: waiting for it to be unlocked before finding windows.");
+    while locked() {
+        match receiver.recv_timeout(poll) {
+            Ok(
+                Event::Exit
+                | Event::Command {
+                    command: commands::Command::Quit,
+                },
+            )
+            | Err(RecvTimeoutError::Disconnected) => return false,
+            Ok(event) => warn!(?event, "ignoring event while the screen is locked"),
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+    info!("The screen is unlocked.");
+    true
 }
 
 impl QueryCmd {
