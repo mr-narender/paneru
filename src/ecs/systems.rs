@@ -14,7 +14,7 @@ use bevy::time::Time;
 use objc2_foundation::NSPoint;
 use std::collections::HashSet;
 use std::pin::Pin;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
@@ -30,15 +30,56 @@ use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
     LowPowerMode, MissionControlActive, Position, ReadDisplayProperties, RestoreWindowState,
-    Scrolling, SendMessageTrigger, SpawnCommandsExt, Unmanaged, WidthRatio, WindowProperties,
+    Scrolling, SendMessageTrigger, SpawnCommandsExt, SystemTheme, Unmanaged, WidthRatio,
+    WindowProperties,
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{
-    Application, Display, Process, Window, WindowManager, WindowOS, bruteforce_windows,
+    Application, Display, Origin, Process, Size, Window, WindowManager, WindowOS,
+    bruteforce_windows,
 };
 use crate::overlay::{FlashMessageManager, OverlayManager};
 use crate::platform::input::TapHealth;
 use crate::platform::{PlatformCallbacks, WinID};
+
+// Keep partially registered observers alive during slow AX startup.
+// A separate, low-frequency retry must not gate discovery of usable windows.
+#[derive(bevy::ecs::component::Component)]
+pub(super) struct PendingApplicationObservation;
+
+// Bounded post-launch recovery budget (in 1s ticks) for newly launched
+// processes and applications whose initial `FreshMarker` grace period expired
+// before readiness, observer registration, or their first window settled.
+#[derive(bevy::ecs::component::Component)]
+pub(crate) struct PendingWindowRecovery(u32);
+
+const WINDOW_RECOVERY_ATTEMPTS: u32 = 60;
+
+impl Default for PendingWindowRecovery {
+    fn default() -> Self {
+        Self(WINDOW_RECOVERY_ATTEMPTS)
+    }
+}
+
+type RecoverableApplications<'w, 's> = Populated<
+    'w,
+    's,
+    (
+        Entity,
+        Option<&'static Application>,
+        Option<&'static ChildOf>,
+        Option<&'static mut PendingWindowRecovery>,
+        Has<PendingApplicationObservation>,
+    ),
+    (
+        Without<Children>,
+        Without<FreshMarker>,
+        Or<(
+            With<PendingWindowRecovery>,
+            With<PendingApplicationObservation>,
+        )>,
+    ),
+>;
 
 /// Processes and applications still inside their spawn grace period, with the
 /// `FreshMarker` that says whether the spawn actually completed in time.
@@ -93,6 +134,24 @@ const LOOP_MAX_TIMEOUT_LOWPOWER_MS: u32 = 2000;
 const LOOP_MAX_TIMEOUT_MS: u32 = 500;
 const TAP_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 const LOOP_TIMEOUT_STEP: u32 = 1;
+
+/// Backs the pump's poll timeout off after a quiet pass.
+///
+/// Grows by half of the current value (at least [`LOOP_TIMEOUT_STEP`]) up to
+/// `limit`. A fixed +1 ms step took ~500 passes, about two minutes, to climb
+/// from a reset to [`LOOP_MAX_TIMEOUT_MS`], and any event resets it, so on a
+/// normal desktop the cap was never reached: a window title changing once a
+/// second was enough to keep the whole schedule running ~30 times a second.
+/// Growing by half reaches the cap in 16 passes (~1.4 s) while keeping each
+/// wait to at most about half the time already spent idle, so the short
+/// free-running timers that fire shortly after an event are not pushed back by
+/// much.
+fn next_pump_timeout(timeout: u32, limit: u32) -> u32 {
+    let timeout = timeout.min(limit);
+    timeout
+        .saturating_add((timeout / 2).max(LOOP_TIMEOUT_STEP))
+        .min(limit)
+}
 
 /// How long [`pump_events`] may spend draining the incoming channel before it
 /// has to hand the frame back, and how many events it may take in one go.
@@ -226,7 +285,11 @@ pub(crate) fn add_existing_application(
     for (mut app, entity) in fresh_apps {
         let mut offscreen_windows = vec![];
 
-        if app.observe().is_ok_and(|result| result)
+        let observed = app.observe().is_ok_and(|result| result);
+        if !observed && let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_insert(PendingApplicationObservation);
+        }
+        if observed
             && let Ok((found_windows, offscreen)) = window_manager
                 .find_existing_application_windows(&mut app, &spaces, &config)
                 .inspect_err(|err| warn!("{err}"))
@@ -296,6 +359,9 @@ pub(crate) fn finish_setup(
 
     let mut focused_managed_window = false;
     for (mut strip, active_strip, _) in &mut workspaces {
+        if strip.virtual_index != 0 {
+            continue;
+        }
         debug!("space {}: before refresh {strip:?}", strip.id());
         let workspace_windows = window_manager
             .windows_in_workspace(strip.id())
@@ -402,7 +468,7 @@ pub(super) fn add_launched_process(
         if children {
             // Process already has an attached Application, so finish.
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_remove::<FreshMarker>();
+                entity_commands.try_remove::<(FreshMarker, PendingWindowRecovery)>();
             }
             continue;
         }
@@ -412,18 +478,42 @@ pub(super) fn add_launched_process(
             return;
         };
 
-        if app.observe().is_ok_and(|good| good) {
-            let timeout = Timeout::new(
-                APP_OBSERVABLE_TIMEOUT,
-                Some(format!(
-                    "{app} did not become observable in {}s.",
-                    APP_OBSERVABLE_TIMEOUT.as_secs()
-                )),
-                &mut commands,
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<(FreshMarker, PendingWindowRecovery)>();
+        }
+
+        // Process readiness precedes usable AX during Emacs startup.
+        // Keep this Application even when subscriptions fail; poll windows separately.
+        let observed = app.observe().is_ok_and(|good| good);
+        let timeout = Timeout::new(
+            APP_OBSERVABLE_TIMEOUT,
+            Some(format!(
+                "{app} did not become observable in {}s.",
+                APP_OBSERVABLE_TIMEOUT.as_secs()
+            )),
+            &mut commands,
+        );
+        // Timing out AX discovery must not destroy the app's
+        // observer. Slow Emacs startup can outlast this grace period.
+        let timeout = Timeout {
+            on_expire: Some(|entity| {
+                entity.try_remove::<(FreshMarker, Timeout)>();
+            }),
+            ..timeout
+        };
+        let mut entity_commands = commands.spawn((
+            app,
+            FreshMarker,
+            PendingWindowRecovery::default(),
+            timeout,
+            ChildOf(entity),
+        ));
+        if !observed {
+            entity_commands.insert(PendingApplicationObservation);
+            debug!(
+                "retaining application with pending observers {}",
+                process.name()
             );
-            commands.spawn((app, FreshMarker, timeout, ChildOf(entity)));
-        } else {
-            debug!("failed to register some observers {}", process.name());
         }
     }
 }
@@ -467,6 +557,62 @@ pub(super) fn add_launched_application(
             debug!("removing FreshMarker from {entity}: windows already created via AXCreated");
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_remove::<FreshMarker>();
+            }
+        }
+    }
+}
+
+/// Retry on the retained Application, preserving already registered callbacks.
+pub(super) fn retry_application_observers(
+    mut apps: Populated<(Entity, &mut Application), With<PendingApplicationObservation>>,
+    mut commands: Commands,
+) {
+    for (entity, mut app) in &mut apps {
+        if app.observe().is_ok_and(|ready| ready) {
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<PendingApplicationObservation>();
+            }
+            debug!("application observers ready for pid {}", app.pid());
+        }
+    }
+}
+
+// Creation notifications can arrive while AX is unresponsive,
+// or before update_frame can read a usable rect. Retaining an observer alone
+// cannot replay that event. Retry newly launched applications with no managed
+// children at one-second intervals for a bounded recovery window, and despawn
+// headless or permanently unobservable processes once that window expires.
+pub(super) fn recover_windowless_applications(
+    mut apps: RecoverableApplications,
+    config: Res<Config>,
+    mut commands: Commands,
+) {
+    for (entity, app, child_of, recovery, pending_observation) in &mut apps {
+        if let Some(app) = app {
+            let windows = app.window_list(&config);
+            if !windows.is_empty() {
+                commands.trigger(SpawnWindowTrigger(windows));
+                continue;
+            }
+        }
+        if let Some(mut recovery) = recovery {
+            recovery.0 = recovery.0.saturating_sub(1);
+            if recovery.0 > 0 {
+                continue;
+            }
+            let despawn_target = if app.is_none() {
+                Some(entity)
+            } else if pending_observation {
+                Some(child_of.map_or(entity, ChildOf::parent))
+            } else {
+                None
+            };
+            if let Some(target) = despawn_target {
+                if let Ok(mut entity_commands) = commands.get_entity(target) {
+                    entity_commands.try_despawn();
+                }
+            } else if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<PendingWindowRecovery>();
             }
         }
     }
@@ -561,6 +707,16 @@ pub(super) fn retry_front_switch(
     }
 }
 
+/// Upper bound on the timestep fed into [`ease_out_factor`].
+///
+/// When the event loop wakes from an idle sleep (up to 500ms, or 2s in low
+/// power mode), `Time::delta_secs_f64()` reports the entire sleep duration on
+/// the wakeup frame. Feeding that straight into the exponential decay would
+/// consume almost the entire distance on Frame 0 and turn the animation into a
+/// single-frame jump. Cap each frame's step to a 30fps tick (matching the
+/// scroll integrator's `MAX_STEP_SECS`) so the wakeup frame steps smoothly.
+const MAX_ANIMATION_STEP_SECS: f64 = 1.0 / 30.0;
+
 /// Animates window movement.
 /// Fraction of the remaining distance an exponential ease-out consumes in a
 /// frame, given a decay `rate` (per second) and the frame's `delta` in seconds.
@@ -570,6 +726,7 @@ pub(super) fn retry_front_switch(
     reason = "clamped to [0, 1], well within f32's range; only sub-pixel precision is lost"
 )]
 fn ease_out_factor(rate: f64, delta: f64) -> f32 {
+    let delta = delta.min(MAX_ANIMATION_STEP_SECS);
     (1.0 - (-rate * delta).exp()).clamp(0.0, 1.0) as f32
 }
 
@@ -724,15 +881,11 @@ pub(crate) fn pump_events(
             break false;
         }
 
-        // Polled before any timed wait: the Cocoa pump above already did this
-        // frame's sleeping, so a quiet channel used to cost another millisecond.
-        let received = match incoming_events.try_recv() {
-            Err(TryRecvError::Empty) => incoming_events.recv_timeout(Duration::from_millis(1)),
-            Err(TryRecvError::Disconnected) => Err(RecvTimeoutError::Disconnected),
-            Ok(event) => Ok(event),
-        };
-        match received {
-            Ok(Event::Exit) | Err(RecvTimeoutError::Disconnected) => {
+        // Non-blocking drain: the Cocoa pump above already did this frame's
+        // sleeping, so an empty channel means we can proceed immediately
+        // without paying an extra millisecond of wait latency.
+        match incoming_events.try_recv() {
+            Ok(Event::Exit) | Err(TryRecvError::Disconnected) => {
                 exit.write(AppExit::Success);
                 return;
             }
@@ -746,7 +899,7 @@ pub(crate) fn pump_events(
                 }
                 *timeout = LOOP_TIMEOUT_STEP;
             }
-            Err(RecvTimeoutError::Timeout) => break true,
+            Err(TryRecvError::Empty) => break true,
         }
     };
 
@@ -763,7 +916,7 @@ pub(crate) fn pump_events(
         } else {
             LOOP_MAX_TIMEOUT_MS
         };
-        *timeout = timeout.min(timeout_limit) + LOOP_TIMEOUT_STEP;
+        *timeout = next_pump_timeout(*timeout, timeout_limit);
     } else {
         // Still backed up: come straight back rather than sleeping on it.
         *timeout = LOOP_TIMEOUT_STEP;
@@ -988,14 +1141,13 @@ pub(super) struct OverlayWindowConfigCache {
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn update_overlays(
-    // Gating lives in the `overlay_dirty` run condition (strip change *or*
-    // focus change); this query just resolves the current active workspace.
     active_workspace: Populated<(Has<Scrolling>, &LayoutStrip), With<ActiveWorkspaceMarker>>,
     windows: Windows,
     applications: Query<&Application>,
     overlay_mgr: Option<NonSendMut<OverlayManager>>,
     mission_control_active: Res<MissionControlActive>,
     config: Res<Config>,
+    theme: Option<Res<SystemTheme>>,
     mut window_config_cache: Local<OverlayWindowConfigCache>,
     window_manager: Res<WindowManager>,
 ) {
@@ -1080,7 +1232,7 @@ pub(super) fn update_overlays(
         };
 
         Some(BorderParams {
-            color: config.border_color(),
+            color: config.border_color(theme.is_some_and(|theme| theme.is_dark)),
             opacity: config.border_opacity(),
             width: config.border_width(),
             radius: window_config_cache
@@ -1139,16 +1291,38 @@ pub(super) fn verify_window_position(
     }
 }
 
+/// Resizes windows whose `Bounds` changed, keeping each one's width as a
+/// share of the display its strip is on: a strip on the display without
+/// focus is sized for its own, and a share of the other would grow or shrink
+/// the window wherever it went next. A window in no strip is of the active
+/// display.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn commit_window_size(
     active_display: ActiveDisplay,
-    mut resized_windows: Populated<(&mut Window, &Bounds, &mut WidthRatio), Changed<Bounds>>,
+    strips: Query<(&LayoutStrip, &ChildOf)>,
+    displays: Query<&Display>,
+    mut resized_windows: Populated<
+        (Entity, &mut Window, &Bounds, &mut WidthRatio),
+        Changed<Bounds>,
+    >,
 ) {
-    let display_bounds = active_display.bounds();
+    let fallback = active_display.bounds().width();
+    let widths: EntityHashMap<i32> = resized_windows
+        .iter()
+        .map(|(entity, ..)| {
+            let width = strips
+                .iter()
+                .find(|(strip, _)| strip.contains(entity))
+                .and_then(|(_, parent)| displays.get(parent.parent()).ok())
+                .map_or(fallback, |display| display.bounds().width());
+            (entity, width)
+        })
+        .collect();
     resized_windows
         .par_iter_mut()
-        .for_each(|(mut window, size, mut width_ratio)| {
-            width_ratio.0 = f64::from(size.0.x) / f64::from(display_bounds.width());
+        .for_each(|(entity, mut window, size, mut width_ratio)| {
+            let width = widths.get(&entity).copied().unwrap_or(fallback);
+            width_ratio.0 = f64::from(size.0.x) / f64::from(width);
             objc2::rc::autoreleasepool(|_| window.resize(size.0));
         });
 }
@@ -1334,6 +1508,26 @@ fn app_shows_window(ax_window_ids: &[WinID], on_screen: &[WinID], window_id: Win
         && (ax_window_ids.is_empty() || ax_window_ids.contains(&window_id))
 }
 
+/// One settled column top on the active strip, collected before any OS/AX queries.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ColumnTopCandidate {
+    entity: Entity,
+    window_id: WinID,
+    position: Origin,
+    bounds: Size,
+    app: Entity,
+    is_single: bool,
+}
+
+impl ColumnTopCandidate {
+    fn shares_frame_with(&self, other: &Self) -> bool {
+        self.entity != other.entity
+            && self.app == other.app
+            && self.position.chebyshev_distance(other.position) <= 1
+            && self.bounds.chebyshev_distance(other.bounds) <= 1
+    }
+}
+
 /// Folds a background native tab that ended up in a column of its own back into
 /// the column of the tab that is actually showing.
 ///
@@ -1354,6 +1548,7 @@ pub(crate) fn regroup_stray_native_tabs(
     mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     window_manager: Res<WindowManager>,
     mission_control: Res<MissionControlActive>,
+    mut last_snapshot: Local<Vec<ColumnTopCandidate>>,
     mut commands: Commands,
 ) {
     if mission_control.0 {
@@ -1365,81 +1560,99 @@ pub(crate) fn regroup_stray_native_tabs(
     else {
         return;
     };
+
+    // Column tops only: a window sharing a column is already grouped, and
+    // stacked siblings never share a frame. Only a column of its own can be a
+    // stray: pulling a window out of a stack or an existing tab group would
+    // break a grouping the user set up.
+    let candidates = strip
+        .columns()
+        .filter_map(|column| {
+            let is_single = matches!(column, Column::Single(_));
+            let entity = column.top()?;
+            let (_, window, Position(position), Bounds(bounds), child) =
+                windows.get(entity).ok()?;
+            Some(ColumnTopCandidate {
+                entity,
+                window_id: window.id(),
+                position: *position,
+                bounds: *bounds,
+                app: child.parent(),
+                is_single,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if *last_snapshot == candidates {
+        return;
+    }
+
+    // Pre-filter in pure ECS before making any WindowServer or Accessibility IPC
+    // calls: only apps that actually have a `Column::Single` sharing its frame
+    // with another column top of the same app can possibly have a stray tab.
+    let has_overlapping_stray = candidates.iter().any(|stray| {
+        stray.is_single
+            && candidates
+                .iter()
+                .any(|other| stray.shares_frame_with(other))
+    });
+    last_snapshot.clone_from(&candidates);
+    if !has_overlapping_stray {
+        return;
+    }
+
     let Some(on_screen) = window_manager.windows_on_screen() else {
         return;
     };
 
-    // Column tops only: a window sharing a column is already grouped, and
-    // stacked siblings never share a frame.
-    let tops = strip.all_columns();
-    // Only a column of its own can be a stray: pulling a window out of a stack
-    // or an existing tab group would break a grouping the user set up.
-    let strays = strip
-        .columns()
-        .filter_map(|column| match column {
-            Column::Single(entity) => Some(*entity),
-            Column::Stack(_) | Column::Tabs(_) | Column::Fullscren(_) => None,
-        })
-        .collect::<Vec<_>>();
-    // One accessibility round trip per app, not per window: this runs on a timer
-    // and the call crosses into the app.
+    // One accessibility round trip per candidate app, not for every app on the
+    // strip: this runs on a timer and the call crosses into the app.
     let mut ax_windows: EntityHashMap<Vec<WinID>> = EntityHashMap::default();
-    let columns = tops
-        .into_iter()
-        .filter_map(|entity| windows.get(entity).ok())
-        .map(
-            |(entity, window, Position(position), Bounds(bounds), child)| {
-                let app = child.parent();
-                let ax_window_ids = ax_windows.entry(app).or_insert_with(|| {
-                    apps.get(app)
-                        .map(|app| app.ax_window_ids())
-                        .unwrap_or_default()
-                });
-                (
-                    entity,
-                    app_shows_window(ax_window_ids, &on_screen, window.id()),
-                    *position,
-                    *bounds,
-                    app,
-                )
-            },
-        )
+    let showing = candidates
+        .iter()
+        .map(|candidate| {
+            let has_overlap = candidates
+                .iter()
+                .any(|other| candidate.shares_frame_with(other));
+            if !has_overlap {
+                return false;
+            }
+            let ax_window_ids = ax_windows.entry(candidate.app).or_insert_with(|| {
+                apps.get(candidate.app)
+                    .map(|app| app.ax_window_ids())
+                    .unwrap_or_default()
+            });
+            app_shows_window(ax_window_ids, &on_screen, candidate.window_id)
+        })
         .collect::<Vec<_>>();
 
     let mut regrouped = Vec::new();
-    for (hidden, showing, position, bounds, app) in &columns {
-        if *showing || regrouped.contains(hidden) || !strays.contains(hidden) {
+    for (idx, hidden) in candidates.iter().enumerate() {
+        if showing[idx] || regrouped.contains(&hidden.entity) || !hidden.is_single {
             continue;
         }
-        let Some((leader, ..)) = columns.iter().find(
-            |(
-                candidate,
-                candidate_showing,
-                candidate_position,
-                candidate_bounds,
-                candidate_app,
-            )| {
-                *candidate_showing
-                    && candidate != hidden
-                    && candidate_app == app
-                    && candidate_position.chebyshev_distance(*position) <= 1
-                    && candidate_bounds.chebyshev_distance(*bounds) <= 1
-            },
-        ) else {
+        let Some((leader_idx, _)) = candidates.iter().enumerate().find(|(cand_idx, candidate)| {
+            showing[*cand_idx] && hidden.shares_frame_with(candidate)
+        }) else {
             continue;
         };
+        let leader = candidates[leader_idx].entity;
 
-        debug!("stray native tab {hidden} folded into the column of {leader}");
+        debug!(
+            "stray native tab {} folded into the column of {leader}",
+            hidden.entity
+        );
         if strip
-            .convert_to_tabs(*leader, *hidden)
+            .convert_to_tabs(leader, hidden.entity)
             .inspect_err(|err| error!("Failed to convert to tabs: {err}"))
             .is_ok()
         {
-            regrouped.push(*hidden);
+            regrouped.push(hidden.entity);
         }
     }
 
     if let Some(leader) = regrouped.first() {
+        last_snapshot.clear();
         commands.reshuffle_around(*leader);
     }
 }
@@ -1533,11 +1746,16 @@ pub(crate) fn detect_tabbed_windows(
 
 /// Listens for focus events for unknown window IDs and attempts to auto-discover
 /// and manage them on the fly (e.g., when a user clicks an unmanaged tab or window).
+///
+/// Asks only the application that owns the window. This runs on the main
+/// thread, which also carries the input tap: asking every application in turn
+/// held each keystroke for as long as the unresponsive ones took to time out.
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn auto_discover_unmanaged_focused_windows(
     mut messages: MessageReader<Event>,
     windows: Query<&Window>,
     apps: Query<&Application>,
+    window_manager: Res<WindowManager>,
     config: Res<Config>,
     mut cache: Local<HashSet<WinID>>,
     mut commands: Commands,
@@ -1558,26 +1776,32 @@ pub(crate) fn auto_discover_unmanaged_focused_windows(
 
         trace!("Focus event for unknown window id {window_id}; attempting on-the-fly discovery.");
 
-        let mut discovered = None;
-        let (frontmost, non_frontmost): (Vec<_>, Vec<_>) =
-            apps.iter().partition(|app| app.is_frontmost());
+        // Not cached: an owner that isn't known yet may be by the next focus.
+        let Some(owner) = window_manager.window_owner(window_id) else {
+            trace!("No owner for focused window {window_id}; skipping discovery.");
+            continue;
+        };
+        let Some(app) = apps.iter().find(|app| app.pid() == owner) else {
+            trace!(
+                "Focused window {window_id} belongs to unknown pid {owner}; skipping discovery."
+            );
+            continue;
+        };
 
-        for app in frontmost.into_iter().chain(non_frontmost) {
-            if let Some(window) = app.focused_window(&config)
-                && window.id() == window_id
-            {
+        let discovered = app
+            .focused_window(&config)
+            .filter(|window| window.id() == window_id)
+            .inspect(|_| {
                 debug!("Discovered unknown focused window {window_id} via focused_window.");
-                discovered = Some(window);
-                break;
-            }
-
-            let window_list = app.window_list(&config);
-            if let Some(window) = window_list.into_iter().find(|w| w.id() == window_id) {
+            })
+            .or_else(|| {
+                let window = app
+                    .window_list(&config)
+                    .into_iter()
+                    .find(|w| w.id() == window_id)?;
                 debug!("Discovered unknown focused window {window_id} via window_list scan.");
-                discovered = Some(window);
-                break;
-            }
-        }
+                Some(window)
+            });
 
         if let Some(window) = discovered {
             commands.trigger(SpawnWindowTrigger(vec![window]));
@@ -1624,5 +1848,81 @@ mod tests {
         app.update();
 
         assert_eq!(tap_config.swipe_gesture_fingers(), Some(3));
+    }
+}
+
+#[cfg(test)]
+mod pump_timeout_tests {
+    use super::{
+        LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS, LOOP_MAX_TIMEOUT_LOWPOWER_MS, LOOP_MAX_TIMEOUT_MS,
+        LOOP_TIMEOUT_STEP, next_pump_timeout,
+    };
+
+    /// Quiet passes from a reset until the timeout sits at `limit`.
+    fn passes_to_reach(limit: u32) -> usize {
+        let mut timeout = LOOP_TIMEOUT_STEP;
+        let mut passes = 0;
+        while timeout < limit {
+            timeout = next_pump_timeout(timeout, limit);
+            passes += 1;
+            assert!(passes < 100, "timeout never reached {limit}");
+        }
+        passes
+    }
+
+    #[test]
+    fn reaches_the_idle_cap_within_a_couple_of_seconds() {
+        assert_eq!(passes_to_reach(LOOP_MAX_TIMEOUT_MS), 16);
+        let mut timeout = LOOP_TIMEOUT_STEP;
+        let mut waited = 0;
+        while timeout < LOOP_MAX_TIMEOUT_MS {
+            waited += timeout;
+            timeout = next_pump_timeout(timeout, LOOP_MAX_TIMEOUT_MS);
+        }
+        assert!(waited < 2000, "took {waited} ms to reach the cap");
+    }
+
+    #[test]
+    fn reaches_the_low_power_cap() {
+        assert!(passes_to_reach(LOOP_MAX_TIMEOUT_LOWPOWER_MS) < 25);
+    }
+
+    #[test]
+    fn holds_at_the_cap() {
+        assert_eq!(
+            next_pump_timeout(LOOP_MAX_TIMEOUT_MS, LOOP_MAX_TIMEOUT_MS),
+            LOOP_MAX_TIMEOUT_MS
+        );
+    }
+
+    #[test]
+    fn clamps_to_a_lower_limit_when_a_frame_starts() {
+        assert_eq!(
+            next_pump_timeout(LOOP_MAX_TIMEOUT_MS, LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS),
+            LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS
+        );
+    }
+
+    #[test]
+    fn always_grows_by_at_least_one_step_below_the_cap() {
+        for timeout in 0..LOOP_MAX_TIMEOUT_MS {
+            assert!(next_pump_timeout(timeout, LOOP_MAX_TIMEOUT_MS) > timeout);
+        }
+    }
+
+    /// The wait after a quiet stretch stays a bounded fraction of the time
+    /// already spent idle, so a timer armed by the event that reset the pump
+    /// fires at most about half its delay late.
+    #[test]
+    fn wait_stays_proportional_to_idle_time() {
+        let mut timeout = LOOP_TIMEOUT_STEP;
+        let mut idle = 0;
+        while timeout < LOOP_MAX_TIMEOUT_MS {
+            idle += timeout;
+            timeout = next_pump_timeout(timeout, LOOP_MAX_TIMEOUT_MS);
+            if idle >= 10 {
+                assert!(timeout <= idle, "waiting {timeout} ms after {idle} ms idle");
+            }
+        }
     }
 }

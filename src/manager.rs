@@ -8,8 +8,8 @@ use derive_more::{DerefMut, with_trait::Deref};
 use mockall::automock;
 use notify::{RecursiveMode, Watcher};
 use objc2_core_foundation::{
-    CFArray, CFDictionary, CFMutableData, CFNumber, CFNumberType, CFRetained, CFString, CFType,
-    CGPoint, CGRect, CGSize, kCFBooleanTrue,
+    CFArray, CFBoolean, CFDictionary, CFMutableData, CFNumber, CFNumberType, CFRetained, CFString,
+    CFType, CGPoint, CGRect, CGSize, kCFBooleanTrue,
 };
 use objc2_core_graphics::{
     CGAssociateMouseAndMouseCursorPosition, CGDirectDisplayID, CGDisplayBounds,
@@ -22,7 +22,7 @@ use std::slice::from_raw_parts_mut;
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use stdext::function_name;
-use tracing::{Level, debug, error, instrument, trace, warn};
+use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use crate::config::Config;
 use crate::errors::{Error, Result};
@@ -36,15 +36,16 @@ pub use display::Display;
 pub use process::{Process, ProcessApi};
 pub use skylight::AXUIElementCopyAttributeValue;
 use skylight::{
-    _AXUIElementCreateWithRemoteToken, SLSCopyActiveMenuBarDisplayIdentifier,
+    _AXUIElementCreateWithRemoteToken, SLSConnectionGetPID, SLSCopyActiveMenuBarDisplayIdentifier,
     SLSCopyAssociatedWindows, SLSCopyManagedDisplaySpaces, SLSCopyWindowsWithOptionsAndTags,
     SLSFindWindowAndOwner, SLSGetConnectionIDForPSN, SLSGetCurrentCursorLocation,
-    SLSGetDisplayMenubarHeight, SLSGetSpaceManagementMode, SLSMainConnectionID,
+    SLSGetDisplayMenubarHeight, SLSGetSpaceManagementMode, SLSGetWindowOwner, SLSMainConnectionID,
     SLSManagedDisplayGetCurrentSpace, SLSSpaceGetType, SLSWindowIsOrderedIn,
     SLSWindowIteratorAdvance, SLSWindowIteratorGetAttributes, SLSWindowIteratorGetParentID,
     SLSWindowIteratorGetTags, SLSWindowIteratorGetWindowID, SLSWindowQueryResultCopyWindows,
     SLSWindowQueryWindows,
 };
+pub(crate) use windows::forget_enhanced_ui_state;
 pub use windows::{Window, WindowApi, WindowOS, WindowPadding, ax_window_id, try_ax_window_id};
 
 #[cfg(test)]
@@ -74,8 +75,20 @@ pub fn size_from(size: CGSize) -> Size {
 }
 
 pub fn irect_from(rect: CGRect) -> IRect {
-    let mid = rect.mid();
-    IRect::from_center_size(origin_from(mid), size_from(rect.size))
+    let origin = origin_from(rect.origin);
+    IRect::from_corners(origin, origin + size_from(rect.size))
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+
+    #[test]
+    fn odd_sized_ax_frame_keeps_its_origin_and_size() {
+        let frame = CGRect::new(CGPoint::new(0.0, 20.0), CGSize::new(399.0, 701.0));
+
+        assert_eq!(irect_from(frame), IRect::new(0, 20, 399, 721));
+    }
 }
 
 /// Defines the interface for a window manager, abstracting OS-specific operations.
@@ -188,6 +201,10 @@ pub trait WindowManagerApi: Send + Sync {
     fn dim_windows(&self, windows: &[WinID], level: f32);
 
     fn windows_on_screen(&self) -> Option<Vec<WinID>>;
+
+    /// Returns the process that owns a window, as the window server has it:
+    /// asks no application, so an unresponsive one can't stall the caller.
+    fn window_owner(&self, window_id: WinID) -> Option<Pid>;
 }
 
 /// `WindowManager` is a Bevy resource that holds a boxed `WindowManagerApi` trait object.
@@ -595,6 +612,18 @@ impl WindowManagerApi for WindowManagerOS {
                 .collect::<Vec<_>>()
         })
     }
+
+    fn window_owner(&self, window_id: WinID) -> Option<Pid> {
+        let mut connection: ConnID = 0;
+        unsafe { SLSGetWindowOwner(self.main_cid, window_id, &mut connection) }
+            .to_result(function_name!())
+            .ok()?;
+        let mut pid: Pid = 0;
+        unsafe { SLSConnectionGetPID(connection, &mut pid) }
+            .to_result(function_name!())
+            .ok()?;
+        (pid != 0).then_some(pid)
+    }
 }
 
 /// Retrieves a list of window IDs for specified spaces and connection, with an option to include minimized windows.
@@ -892,6 +921,19 @@ pub fn check_ax_privilege() -> bool {
     unsafe { AXIsProcessTrusted() }
 }
 
+/// Whether the login session's screen is locked. While it is, Accessibility
+/// answers for no application's windows, so a scan then finds none.
+pub fn screen_is_locked() -> bool {
+    let Some(session) = objc2_core_graphics::CGSessionCopyCurrentDictionary() else {
+        return false;
+    };
+    let session = unsafe { session.cast_unchecked::<CFString, CFType>() };
+    session
+        .get(&CFString::from_static_str("CGSSessionScreenIsLocked"))
+        .and_then(|value| value.downcast_ref::<CFBoolean>().map(CFBoolean::value))
+        .unwrap_or(false)
+}
+
 /// Requests Accessibility privileges once through the native macOS prompt.
 ///
 /// Subsequent permission polling must use [`check_ax_privilege`] so the system
@@ -905,6 +947,39 @@ pub fn request_ax_privilege() -> bool {
         let values = [kCFBooleanTrue.unwrap()];
         let opts = CFDictionary::from_slices(&keys, &values);
         AXIsProcessTrustedWithOptions((&raw const *opts).cast())
+    }
+}
+
+/// Resets the TCC Accessibility entry for Paneru (`com.github.karinushka.paneru`).
+///
+/// Rebuilding the binary or switching between Homebrew and Cargo changes the
+/// ad-hoc code-signing hash (`cdhash`), leaving a stale TCC entry that
+/// prevents macOS from honoring the existing toggle or re-displaying the
+/// system prompt until the entry is cleared.
+pub fn reset_ax_privilege() -> bool {
+    match std::process::Command::new("/usr/bin/tccutil")
+        .args(["reset", "Accessibility", crate::platform::service::ID])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            info!(
+                bundle_id = crate::platform::service::ID,
+                "reset TCC Accessibility entry"
+            );
+            true
+        }
+        Ok(output) => {
+            warn!(
+                status = %output.status,
+                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "tccutil reset Accessibility failed"
+            );
+            false
+        }
+        Err(error) => {
+            warn!(%error, "unable to run tccutil to reset Accessibility entry");
+            false
+        }
     }
 }
 
