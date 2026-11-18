@@ -1,5 +1,5 @@
 use bevy::app::{App, Plugin, Update};
-use bevy::ecs::change_detection::{DetectChanges, DetectChangesMut, Ref};
+use bevy::ecs::change_detection::DetectChangesMut;
 use bevy::ecs::component::Component;
 use bevy::ecs::entity::{Entity, EntityHashMap, EntityHashSet};
 use bevy::ecs::hierarchy::ChildOf;
@@ -14,11 +14,11 @@ use tracing::{Level, instrument, trace};
 
 use crate::config::Config;
 use crate::ecs::params::Windows;
-use crate::ecs::workspace::SnapStripMarker;
+use crate::ecs::workspace::{PreviousStripPosition, SnapStripMarker};
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, Initializing, LayoutPosition,
-    ManualStripOffset, Position, RepositionMarker, ReshuffleAroundMarker, Scrolling,
-    SpawnCommandsExt,
+    Bounds, DockPosition, EnsureVisibleMarker, Initializing, LayoutPosition, ManualStripOffset,
+    ParkedTabMarker, Position, RepositionMarker, ReshuffleAroundMarker, ResizeAnchor, ResizeMarker,
+    Scrolling, SpawnCommandsExt,
 };
 use crate::errors::{Error, Result};
 use crate::manager::{Display, Origin, Size, Window};
@@ -37,8 +37,9 @@ pub struct LayoutEventsPlugin;
 /// frame has left the display entirely to whichever display it landed on.
 pub(crate) const PARKED_STRIP_SLIVER: i32 = 10;
 
-/// A strip, its entity, origin, display, whether it's the active one, and the
-/// offset it is animating toward if a move is already in flight.
+/// A strip, its entity, origin, display, any in-flight target offset, and
+/// whether it carries a saved position waiting to be restored by
+/// [`crate::ecs::workspace::show_active_workspace`].
 /// Shared by [`reshuffle_layout_strip`] and [`ensure_visible_in_strip`].
 type StripPlacements<'w, 's> = Query<
     'w,
@@ -48,8 +49,8 @@ type StripPlacements<'w, 's> = Query<
         Entity,
         &'static Position,
         &'static ChildOf,
-        Option<Ref<'static, ActiveWorkspaceMarker>>,
         Option<&'static RepositionMarker>,
+        Has<PreviousStripPosition>,
     ),
 >;
 
@@ -57,9 +58,9 @@ type StripPlacements<'w, 's> = Query<
 /// raw bounds into the usable viewport.
 type DisplayViewports<'w, 's> = Query<'w, 's, (&'static Display, Option<&'static DockPosition>)>;
 
-/// A strip, its entity, its own scroll position, whether it's mid-swipe, and
-/// its parent display. Used by [`position_layout_windows`] to build each
-/// window's [`StripWindowContext`].
+/// A strip, its entity, its own scroll position (and any in-flight target),
+/// whether it's mid-swipe, and its parent display. Used by
+/// [`position_layout_windows`] to build each window's [`StripWindowContext`].
 type StripsForWindowPositioning<'w, 's> = Query<
     'w,
     's,
@@ -67,26 +68,20 @@ type StripsForWindowPositioning<'w, 's> = Query<
         Entity,
         &'static LayoutStrip,
         &'static Position,
+        Option<&'static RepositionMarker>,
         Has<Scrolling>,
         &'static ChildOf,
     ),
     With<LayoutStrip>,
 >;
 
-/// Windows whose size or origin changed this tick — either one means the strip
-/// holding them has to re-run its layout.
-type ResizedWindows<'w, 's> = Populated<
-    'w,
-    's,
-    Entity,
-    Or<(
-        (Changed<Bounds>, With<Window>),
-        (Changed<Position>, With<Window>),
-    )>,
->;
+/// Windows whose size or target size changed this tick — the strip holding them
+/// has to re-run its layout.
+type ResizedWindows<'w, 's> =
+    Populated<'w, 's, Entity, (Or<(Changed<Bounds>, Changed<ResizeMarker>)>, With<Window>)>;
 
-/// Window frames as the layout writes them: the current origin, and the size and
-/// slot the layout pass is free to overwrite.
+/// Window frames as the layout writes them: the current origin, the size and
+/// slot the layout pass is free to overwrite, and any in-flight resize target.
 type WindowFrames<'w, 's> = Query<
     'w,
     's,
@@ -94,6 +89,7 @@ type WindowFrames<'w, 's> = Query<
         &'static Position,
         &'static mut Bounds,
         &'static mut LayoutPosition,
+        Option<&'static mut ResizeMarker>,
     ),
     (Without<LayoutStrip>, With<Window>),
 >;
@@ -109,9 +105,19 @@ type RepositionedWindows<'w, 's> = Populated<
         &'static LayoutPosition,
         &'static mut Position,
         &'static mut Bounds,
+        Option<&'static ResizeMarker>,
+        Has<ParkedTabMarker>,
     ),
     (Changed<LayoutPosition>, With<Window>, Without<LayoutStrip>),
 >;
+
+/// Strips whose position or target offset changed this tick.
+type MovedStrips<'w, 's> =
+    Populated<'w, 's, &'static LayoutStrip, Or<(Changed<Position>, Changed<RepositionMarker>)>>;
+
+/// Windows marked for strip reshuffling, paired with their layout slot.
+type ReshuffleMarkers<'w, 's> =
+    Query<'w, 's, (Entity, &'static LayoutPosition), With<ReshuffleAroundMarker>>;
 
 /// Clamp a window origin to the range where it still touches both viewport
 /// edges. For an oversized window this range is reversed: from right-aligned
@@ -138,12 +144,15 @@ const SIGNATURE_WIDTH_TOLERANCE: i32 = 2;
 /// the point: scrolling must not invalidate a deliberate placement.
 pub(crate) fn strip_signature(strip: &LayoutStrip, windows: &Windows) -> Vec<(Entity, i32)> {
     strip
-        .all_columns()
-        .into_iter()
+        .columns()
+        .filter_map(Column::top)
         .filter_map(|entity| {
-            windows
-                .moving_frame(entity)
-                .map(|frame| (entity, frame.width()))
+            let width = strip
+                .active_tab(entity)
+                .and_then(|active| windows.moving_frame(active))
+                .or_else(|| windows.moving_frame(entity))?
+                .width();
+            Some((entity, width))
         })
         .collect()
 }
@@ -184,9 +193,7 @@ impl Plugin for LayoutEventsPlugin {
                     position_layout_windows,
                 )
                     .chain()
-                    .after(super::systems::finish_setup)
-                    .after(super::triggers::apply_window_positions)
-                    .before(super::workspace::show_active_workspace)
+                    .in_set(super::UpdateSet::Layout)
                     .run_if(not(resource_exists::<Initializing>)),
             ),
         );
@@ -367,6 +374,28 @@ impl Iterator for ColumnWindowIter<'_> {
     }
 }
 
+/// A group of windows that relocates together, returned by
+/// [`LayoutStrip::relocation_group`]. The variants need different re-insertion
+/// (`append_tab_group` vs `append_tabbed_stack`), so don't flatten them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RelocationGroup {
+    /// A native-OS tab group (`Column::Tabs`/`StackItem::Tabs`).
+    NativeTabs(Vec<Entity>),
+    /// A tabbed-display `Column::Stack` and its active tab.
+    TabbedStack {
+        members: Vec<Entity>,
+        active: Entity,
+    },
+}
+
+impl RelocationGroup {
+    pub fn members(&self) -> &[Entity] {
+        match self {
+            Self::NativeTabs(members) | Self::TabbedStack { members, .. } => members,
+        }
+    }
+}
+
 /// `LayoutStrip` manages a horizontal strip of `Panel`s, where each panel can contain a single window or a stack of windows.
 /// It provides methods for manipulating the arrangement and access to windows within the pane.
 #[derive(Component, Debug, Default)]
@@ -374,15 +403,11 @@ pub struct LayoutStrip {
     id: WorkspaceId,
     pub virtual_index: u32,
     columns: VecDeque<Column>,
-    /// Entities belonging to a `Column::Stack` currently displayed as tabs (one visible, sharing
-    /// the full column rect) instead of split heights. Membership, not a `Column` variant — a Stack
-    /// is "tabbed" iff any of its member entities is in this set; the invariant that either all or
-    /// none of one Stack's members are present is maintained by `toggle_tabbed_display` and by the
-    /// cleanup in `remove_column`/ `unstack`/`stack`. This is deliberately independent of
-    /// `Column::Tabs`/`StackItem::Tabs` (native-OS-tab detection, see `tabbed`/`tab_group` below)
-    /// and of `LayoutStrip::tabbed()`, which callers like
-    /// `apply_window_positions`/`give_away_focus` already key off for that unrelated feature.
-    tabbed_stacks: EntityHashSet,
+    /// Members of `Column::Stack`s displayed as tabs (one visible, the rest
+    /// parked off-screen), each mapped to its group's active tab. Either all
+    /// or none of a Stack's members are keys, all with the same value.
+    /// Independent of native-OS tabs (`Column::Tabs`, `tabbed()`).
+    tabbed_stacks: EntityHashMap<Entity>,
 }
 
 impl LayoutStrip {
@@ -391,7 +416,7 @@ impl LayoutStrip {
             id,
             virtual_index,
             columns: VecDeque::new(),
-            tabbed_stacks: EntityHashSet::default(),
+            tabbed_stacks: EntityHashMap::default(),
         }
     }
 
@@ -402,7 +427,7 @@ impl LayoutStrip {
             id,
             virtual_index: 0,
             columns,
-            tabbed_stacks: EntityHashSet::default(),
+            tabbed_stacks: EntityHashMap::default(),
         }
     }
 
@@ -469,6 +494,56 @@ impl LayoutStrip {
 
     pub(crate) fn append_strip(&mut self, other: &mut Self) {
         self.columns.append(&mut other.columns);
+        self.tabbed_stacks.extend(other.tabbed_stacks.drain());
+    }
+
+    /// Extracts all windows in `moved` from `self` and appends them to `target`,
+    /// preserving column, stack, and tab structure for any column whose members
+    /// all move together.
+    pub(crate) fn extract_windows_into(&mut self, moved: &EntityHashSet, target: &mut Self) {
+        let mut index = 0;
+        while index < self.columns.len() {
+            let all_moving = self.columns[index]
+                .window_iter()
+                .all(|entity| moved.contains(&entity));
+            if all_moving {
+                if let Some(column) = self.columns.remove(index) {
+                    for entity in column.window_iter() {
+                        if let Some(active) = self.tabbed_stacks.remove(&entity) {
+                            target.tabbed_stacks.insert(entity, active);
+                        }
+                    }
+                    target.columns.push_back(column);
+                }
+                continue;
+            }
+
+            let moving_in_col = self.columns[index]
+                .window_iter()
+                .filter(|entity| moved.contains(entity))
+                .collect::<Vec<_>>();
+            if moving_in_col.is_empty() {
+                index += 1;
+                continue;
+            }
+
+            for entity in moving_in_col {
+                if !self.contains(entity) {
+                    continue;
+                }
+                let group = self
+                    .tab_group(entity)
+                    .unwrap_or_else(|| vec![entity])
+                    .into_iter()
+                    .filter(|member| moved.contains(member))
+                    .collect::<Vec<_>>();
+                for member in &group {
+                    self.remove(*member);
+                }
+                target.append_tab_group(&group);
+            }
+            index += 1;
+        }
     }
 
     pub fn append_tab_group(&mut self, entities: &[Entity]) {
@@ -565,7 +640,6 @@ impl LayoutStrip {
                     // Already removed from self.columns.
                 }
                 Column::Stack(mut stack) => {
-                    self.tabbed_stacks.remove(&entity);
                     for item in &mut stack {
                         match item {
                             StackItem::Single(_) => {}
@@ -578,15 +652,10 @@ impl LayoutStrip {
                         StackItem::Single(id) => *id != entity,
                         StackItem::Tabs(tabs) => !tabs.is_empty(),
                     });
+                    self.reconcile_tabbed_stacks_after_departure(&[entity], &stack);
                     if stack.len() > 1 {
                         self.columns.insert(index, Column::Stack(stack));
                     } else if let Some(remaining_item) = stack.first() {
-                        // A single surviving item can no longer be a tabbed
-                        // display (nothing left to switch between) — drop
-                        // its membership so a stale entry can't linger.
-                        for e in remaining_item.window_iter() {
-                            self.tabbed_stacks.remove(&e);
-                        }
                         match remaining_item {
                             StackItem::Single(id) => {
                                 self.columns.insert(index, Column::Single(*id));
@@ -605,6 +674,32 @@ impl LayoutStrip {
                         self.columns.insert(index, Column::Single(*remaining_id));
                     }
                 }
+            }
+        }
+    }
+
+    /// Fixes up `tabbed_stacks` after `removed` leave a group: promotes the
+    /// first surviving item's top if the active tab left, and untabs when fewer
+    /// than two stack items remain. `remaining_items` must not contain `removed`.
+    fn reconcile_tabbed_stacks_after_departure(
+        &mut self,
+        removed: &[Entity],
+        remaining_items: &[StackItem],
+    ) {
+        let group_active = removed
+            .iter()
+            .find_map(|e| self.tabbed_stacks.get(e).copied());
+        let was_active = group_active.is_some_and(|active| removed.contains(&active));
+        for e in removed {
+            self.tabbed_stacks.remove(e);
+        }
+        if remaining_items.len() < 2 {
+            for e in remaining_items.iter().flat_map(StackItem::window_iter) {
+                self.tabbed_stacks.remove(&e);
+            }
+        } else if was_active && let Some(new_active) = remaining_items[0].top() {
+            for e in remaining_items.iter().flat_map(StackItem::window_iter) {
+                self.tabbed_stacks.insert(e, new_active);
             }
         }
     }
@@ -647,46 +742,52 @@ impl LayoutStrip {
         self.columns.len()
     }
 
-    /// Returns the first `Panel` in the pane.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(Panel)` with the first panel, otherwise `Err(Error)` if the pane is empty.
-    pub fn first(&self) -> Result<Column> {
-        self.columns.front().cloned().ok_or(Error::NotFound(format!(
-            "{}: can not find first element.",
-            function_name!()
-        )))
+    /// Returns the landing window entity of column `index` (its active tab for
+    /// a tabbed-display stack, or `top()` otherwise).
+    pub fn column_at(&self, index: usize) -> Option<Entity> {
+        self.columns
+            .get(index)
+            .and_then(Column::top)
+            .map(|entity| self.landing_entity(entity))
     }
 
-    /// Returns the last `Panel` in the pane.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(Panel)` with the last panel, otherwise `Err(Error)` if the pane is empty.
-    pub fn last(&self) -> Result<Column> {
-        self.columns.back().cloned().ok_or(Error::NotFound(format!(
-            "{}: can not find last element.",
-            function_name!()
-        )))
+    /// Returns the landing window entity of the first column in the strip.
+    pub fn first(&self) -> Option<Entity> {
+        self.column_at(0)
+    }
+
+    /// Returns the landing window entity of the last column in the strip.
+    pub fn last(&self) -> Option<Entity> {
+        self.columns
+            .len()
+            .checked_sub(1)
+            .and_then(|i| self.column_at(i))
     }
 
     pub fn right_neighbour(&self, entity: Entity) -> Option<Entity> {
         let index = self.index_of(entity).ok()?;
         let stack_pos = self.columns.get(index)?.position_of(entity)?;
-        (index < self.columns.len())
+        let candidate = (index < self.columns.len())
             .then_some(index + 1)
             .and_then(|i| self.columns.get(i))
-            .and_then(|col| col.at_or_last(stack_pos))
+            .and_then(|col| col.at_or_last(stack_pos))?;
+        Some(self.landing_entity(candidate))
     }
 
     pub fn left_neighbour(&self, entity: Entity) -> Option<Entity> {
         let index = self.index_of(entity).ok()?;
         let stack_pos = self.columns.get(index)?.position_of(entity)?;
-        (index > 0)
+        let candidate = (index > 0)
             .then(|| index - 1)
             .and_then(|i| self.columns.get(i))
-            .and_then(|col| col.at_or_last(stack_pos))
+            .and_then(|col| col.at_or_last(stack_pos))?;
+        Some(self.landing_entity(candidate))
+    }
+
+    /// Redirects `candidate` to its group's active tab, if any. Landing on a
+    /// parked tab by row index would focus a hidden window and switch tabs.
+    fn landing_entity(&self, candidate: Entity) -> Entity {
+        self.active_tab(candidate).unwrap_or(candidate)
     }
 
     /// Stacks the window with the given ID onto the panel to its left.
@@ -705,10 +806,18 @@ impl LayoutStrip {
             // Can not stack to the left if left most window already.
             return Ok(());
         }
+        // A native full-screen window keeps its column to itself: checked
+        // before either column is taken out, so neither is lost.
+        if [index, index - 1]
+            .iter()
+            .any(|&at| matches!(self.columns.get(at), Some(Column::Fullscren(_))))
+        {
+            return Ok(());
+        }
 
         let column_to_stack = self.columns.remove(index).unwrap();
         let items_to_stack = match column_to_stack {
-            Column::Fullscren(_) => return Ok(()),
+            Column::Fullscren(_) => unreachable!("checked above"),
             Column::Single(id) => vec![StackItem::Single(id)],
             Column::Tabs(tabs) => vec![StackItem::Tabs(tabs)],
             Column::Stack(items) => items,
@@ -716,22 +825,26 @@ impl LayoutStrip {
 
         let target_column = self.columns.remove(index - 1).unwrap();
         // If the column being merged into is already a tabbed display, the
-        // newly-joined items must join `tabbed_stacks` too — otherwise the
-        // merged Stack would end up with a mix of tabbed and split members,
-        // which `relative_positions`'s tabbed-column geometry branch isn't
-        // designed to represent.
+        // newly-joined items must join `tabbed_stacks` too, mapped to the
+        // same active tab — otherwise the merged Stack would end up with a
+        // mix of tabbed and split members, which `relative_positions`'s
+        // tabbed-column geometry branch isn't designed to represent.
         if let Column::Stack(items) = &target_column
-            && items
+            && let Some(active) = items
                 .iter()
                 .flat_map(StackItem::window_iter)
-                .any(|e| self.tabbed_stacks.contains(&e))
+                .find_map(|e| self.tabbed_stacks.get(&e).copied())
         {
-            for item in &items_to_stack {
-                self.tabbed_stacks.extend(item.window_iter());
+            for member in items_to_stack.iter().flat_map(StackItem::window_iter) {
+                self.tabbed_stacks.insert(member, active);
+            }
+        } else {
+            for member in items_to_stack.iter().flat_map(StackItem::window_iter) {
+                self.tabbed_stacks.remove(&member);
             }
         }
         let new_column = match target_column {
-            Column::Fullscren(_) => return Ok(()),
+            Column::Fullscren(_) => unreachable!("checked above"),
             Column::Single(id) => {
                 Column::Stack([vec![StackItem::Single(id)], items_to_stack].concat())
             }
@@ -742,6 +855,75 @@ impl LayoutStrip {
         };
 
         self.columns.insert(index - 1, new_column);
+        Ok(())
+    }
+
+    /// Consumes the column to the right of `entity`'s column into it. The
+    /// column survives at its own position; its own item(s) stay on top,
+    /// the consumed column's item(s) join the bottom. No-op if there is no
+    /// column to the right, or if either column is a `Column::Fullscren` —
+    /// checked *before* anything is removed from `self.columns`, unlike
+    /// `stack`'s equivalent guards, so a Fullscreen column can never be
+    /// silently dropped from the strip.
+    ///
+    /// # Arguments
+    ///
+    /// * `entity` - Entity of the window whose column should consume its
+    ///   right neighbor.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if consuming succeeded or wasn't needed, otherwise
+    /// `Err(Error)` if the window is not found.
+    pub fn consume(&mut self, entity: Entity) -> Result<()> {
+        let index = self.index_of(entity)?;
+        if index + 1 >= self.columns.len() {
+            // Nothing to the right to consume.
+            return Ok(());
+        }
+        if matches!(self.columns.get(index), Some(Column::Fullscren(_)))
+            || matches!(self.columns.get(index + 1), Some(Column::Fullscren(_)))
+        {
+            return Ok(());
+        }
+
+        let own_column = self.columns.remove(index).unwrap();
+        // After removing `index`, whatever was at `index + 1` has shifted
+        // down to `index`.
+        let neighbor_column = self.columns.remove(index).unwrap();
+
+        let own_items = match own_column {
+            Column::Single(id) => vec![StackItem::Single(id)],
+            Column::Tabs(tabs) => vec![StackItem::Tabs(tabs)],
+            Column::Stack(items) => items,
+            Column::Fullscren(_) => unreachable!("guarded above"),
+        };
+        let neighbor_items = match neighbor_column {
+            Column::Single(id) => vec![StackItem::Single(id)],
+            Column::Tabs(tabs) => vec![StackItem::Tabs(tabs)],
+            Column::Stack(items) => items,
+            Column::Fullscren(_) => unreachable!("guarded above"),
+        };
+
+        // Same `tabbed_stacks` bookkeeping `stack` does for its own merge,
+        // checked against the surviving (own) column instead of the target —
+        // see `stack`'s equivalent comment above.
+        if let Some(active) = own_items
+            .iter()
+            .flat_map(StackItem::window_iter)
+            .find_map(|e| self.tabbed_stacks.get(&e).copied())
+        {
+            for member in neighbor_items.iter().flat_map(StackItem::window_iter) {
+                self.tabbed_stacks.insert(member, active);
+            }
+        } else {
+            for member in neighbor_items.iter().flat_map(StackItem::window_iter) {
+                self.tabbed_stacks.remove(&member);
+            }
+        }
+
+        self.columns
+            .insert(index, Column::Stack([own_items, neighbor_items].concat()));
         Ok(())
     }
 
@@ -757,52 +939,51 @@ impl LayoutStrip {
     /// `Ok(())` if the unstacking is successful or not needed, otherwise `Err(Error)` if the window is not found.
     pub fn unstack(&mut self, entity: Entity) -> Result<()> {
         let index = self.index_of(entity)?;
-        let column = self.columns.remove(index).unwrap();
-
-        if let Column::Stack(mut items) = column {
-            let item_index = items
-                .iter()
-                .position(|item| item.contains(entity))
-                .ok_or(Error::NotFound(format!("Entity {entity} not in stack")))?;
-
-            let removed_item = items.remove(item_index);
-
-            // The unstacked item no longer shares a column with its former
-            // stack-mates, so it can't remain part of a tabbed display.
-            for e in removed_item.window_iter() {
-                self.tabbed_stacks.remove(&e);
-            }
-
-            // Re-insert the unstacked item as a single/tabs panel
-            let unstacked_column = match removed_item {
-                StackItem::Single(id) => Column::Single(id),
-                StackItem::Tabs(tabs) => Column::Tabs(tabs),
-            };
-            self.columns.insert(index, unstacked_column);
-
-            // Re-insert the modified stack (if not empty) at the original position
-            if !items.is_empty() {
-                let new_column = if items.len() == 1 {
-                    // A single surviving item can no longer be a tabbed
-                    // display — drop its membership (see remove_column).
-                    for e in items[0].window_iter() {
-                        self.tabbed_stacks.remove(&e);
-                    }
-                    match items.remove(0) {
-                        StackItem::Single(id) => Column::Single(id),
-                        StackItem::Tabs(tabs) => Column::Tabs(tabs),
-                    }
-                } else {
-                    Column::Stack(items)
-                };
-                self.columns.insert(index, new_column);
-            }
-            Ok(())
-        } else {
-            // Not in a stack, put it back
-            self.columns.insert(index, column);
-            Ok(())
+        if !matches!(self.columns.get(index), Some(Column::Stack(_))) {
+            return Ok(());
         }
+        let Some(Column::Stack(mut items)) = self.columns.remove(index) else {
+            unreachable!("checked above");
+        };
+
+        let item_index = items
+            .iter()
+            .position(|item| item.contains(entity))
+            .ok_or(Error::NotFound(format!("Entity {entity} not in stack")))?;
+
+        let removed_item = items.remove(item_index);
+
+        // The unstacked item no longer shares a column with its former
+        // stack-mates, so it can't remain part of a tabbed display.
+        let removed: Vec<Entity> = removed_item.window_iter().collect();
+        self.reconcile_tabbed_stacks_after_departure(&removed, &items);
+
+        // Re-insert the unstacked item as a single/tabs panel
+        let unstacked_column = match removed_item {
+            StackItem::Single(id) => Column::Single(id),
+            StackItem::Tabs(tabs) => Column::Tabs(tabs),
+        };
+        self.columns.insert(index, unstacked_column);
+
+        // Re-insert the modified stack (if not empty) at the original position
+        if !items.is_empty() {
+            let new_column = if items.len() == 1 {
+                match items.remove(0) {
+                    StackItem::Single(id) => Column::Single(id),
+                    StackItem::Tabs(tabs) => Column::Tabs(tabs),
+                }
+            } else {
+                Column::Stack(items)
+            };
+            self.columns.insert(index, new_column);
+        }
+        Ok(())
+    }
+
+    /// Iterates over all window entities in the strip in column/row order without
+    /// allocating intermediate per-column vectors.
+    pub fn window_iter(&self) -> impl Iterator<Item = Entity> + '_ {
+        self.columns.iter().flat_map(Column::window_iter)
     }
 
     /// Returns a vector of all window IDs present in all panels within the pane, maintaining their order.
@@ -812,14 +993,7 @@ impl LayoutStrip {
     ///
     /// A `Vec<Entity>` containing all window IDs.
     pub fn all_windows(&self) -> Vec<Entity> {
-        self.columns
-            .iter()
-            .flat_map(|column| match column {
-                Column::Single(entity) | Column::Fullscren(entity) => vec![*entity],
-                Column::Stack(items) => items.iter().flat_map(StackItem::window_iter).collect(),
-                Column::Tabs(ids) => ids.clone(),
-            })
-            .collect()
+        self.window_iter().collect()
     }
 
     pub fn get_column_mut(&mut self, index: usize) -> Option<&mut Column> {
@@ -827,7 +1001,11 @@ impl LayoutStrip {
     }
 
     pub fn all_columns(&self) -> Vec<Entity> {
-        self.columns.iter().filter_map(Column::top).collect()
+        self.columns
+            .iter()
+            .filter_map(Column::top)
+            .map(|entity| self.landing_entity(entity))
+            .collect()
     }
 
     pub fn id(&self) -> WorkspaceId {
@@ -857,17 +1035,16 @@ impl LayoutStrip {
                     Column::Tabs(tabs) => vec![StackItem::Tabs(tabs.clone())],
                 };
 
-                // A tabbed display shares one frame across every member,
-                // sized to the whole column — the same "shared frame" idiom
-                // this function already uses for native-tab `StackItem::Tabs`
-                // members, just applied to the whole outer Stack. This also
+                // A tabbed display gives every member the whole column's
+                // frame; `position_layout_windows` parks the inactive ones
+                // off-screen (hidden, not just occluded). This also
                 // sidesteps `binpack_heights`'s `MIN_WINDOW_HEIGHT` capacity
                 // limit entirely, since it isn't called for this branch.
                 let is_tabbed_column = matches!(column, Column::Stack(_))
                     && items
-                        .iter()
-                        .flat_map(StackItem::window_iter)
-                        .any(|e| self.tabbed_stacks.contains(&e));
+                        .first()
+                        .and_then(StackItem::top)
+                        .is_some_and(|e| self.tabbed_stacks.contains_key(&e));
 
                 let heights = if is_tabbed_column {
                     vec![layout_strip_height; items.len()]
@@ -880,16 +1057,24 @@ impl LayoutStrip {
                     binpack_heights(&current_heights, MIN_WINDOW_HEIGHT, layout_strip_height)?
                 };
 
-                // Every window in a column shares the master's (top item's)
-                // width, so a window stacked onto a master of a different width
-                // resizes to match it instead of keeping its own width. This
-                // also matches the column slot width from column_positions,
+                // Every window in a column shares one width, so a window
+                // stacked onto a master of a different width resizes to
+                // match it instead of keeping its own width. This also
+                // matches the column slot width from `column_positions`,
                 // which is the widest member.
-                let column_width = items
-                    .first()
-                    .and_then(StackItem::top)
-                    .and_then(&get_window_frame)
-                    .map(|frame| frame.width())?;
+                //
+                // Tabbed displays use the widest member: macOS may only
+                // partially apply a resize to a parked (off-screen) member
+                // (`resize_staging_origin`), and that always undershoots.
+                let column_width = if is_tabbed_column {
+                    column.width(get_window_frame)?
+                } else {
+                    items
+                        .first()
+                        .and_then(StackItem::top)
+                        .and_then(get_window_frame)
+                        .map(|frame| frame.width())?
+                };
 
                 let mut next_y = 0;
                 let frames = items
@@ -901,7 +1086,13 @@ impl LayoutStrip {
                         frame.min.x = position;
                         frame.max.x = frame.min.x + column_width;
 
-                        frame.min.y = next_y;
+                        if is_tabbed_column {
+                            // `position_layout_windows` parks inactive
+                            // members to the side, not below.
+                            frame.min.y = 0;
+                        } else {
+                            frame.min.y = next_y;
+                        }
                         frame.max.y = frame.min.y + height;
 
                         if !is_tabbed_column {
@@ -938,7 +1129,37 @@ impl LayoutStrip {
         })
     }
 
+    /// The window to take over focus from `entity` as it goes, as niri picks
+    /// it: the one below it in its stack, else the one above; else `opener`,
+    /// the window it was opened from, if that is still in the column to its
+    /// left; else the column to its right, or at the strip's right edge the
+    /// one to its left.
+    pub fn heir(&self, entity: Entity, opener: Option<Entity>) -> Option<Entity> {
+        let index = self.index_of(entity).ok()?;
+        if let Ok(Column::Stack(items)) = self.get(index)
+            && let Some(pos) = items.iter().position(|item| item.contains(entity))
+        {
+            let mate = items
+                .get(pos + 1)
+                .or_else(|| pos.checked_sub(1).and_then(|above| items.get(above)))
+                .and_then(StackItem::top);
+            if mate.is_some() {
+                return mate;
+            }
+        }
+        if let Some(opener) = opener
+            && self.index_of(opener).is_ok_and(|at| at + 1 == index)
+        {
+            return Some(self.landing_entity(opener));
+        }
+        self.right_neighbour(entity)
+            .or_else(|| self.left_neighbour(entity))
+    }
+
     pub fn above(&self, entity: Entity) -> Option<Entity> {
+        if self.is_tabbed_display(entity) {
+            return None;
+        }
         let index = self.index_of(entity).ok()?;
         let column = self.get(index).ok()?;
         match column {
@@ -986,6 +1207,90 @@ impl LayoutStrip {
             .is_some_and(|column| matches!(column, Column::Fullscren(_)))
     }
 
+    /// Returns the group `entity` must relocate with when it moves to another
+    /// strip: its tabbed-display stack (checked first in O(1) so a nested
+    /// `StackItem::Tabs` moves with its enclosing tabbed stack), else its
+    /// native tab group. `None` if ungrouped, so the caller moves `entity`
+    /// alone.
+    pub fn relocation_group(&self, entity: Entity) -> Option<RelocationGroup> {
+        if let Some(active) = self.active_tab(entity) {
+            let index = self.index_of(entity).ok()?;
+            let Column::Stack(items) = self.get(index).ok()? else {
+                return None;
+            };
+            let members = items.iter().flat_map(StackItem::window_iter).collect();
+            return Some(RelocationGroup::TabbedStack { members, active });
+        }
+        self.tab_group(entity).map(RelocationGroup::NativeTabs)
+    }
+
+    /// Inserts `entities` at column `index` (clamped) as a tabbed-display
+    /// `Column::Stack` with `active` as the visible tab.
+    pub fn insert_tabbed_stack_at(&mut self, index: usize, entities: &[Entity], active: Entity) {
+        let group = dedup_entities(entities);
+        if group.is_empty() {
+            return;
+        }
+
+        for entity in &group {
+            self.remove(*entity);
+        }
+
+        let index = index.min(self.len());
+        if group.len() == 1 {
+            self.insert_at(index, group[0]);
+            return;
+        }
+
+        let active = if group.contains(&active) {
+            active
+        } else {
+            group[0]
+        };
+        let items = group
+            .iter()
+            .map(|&entity| StackItem::Single(entity))
+            .collect();
+        if index >= self.len() {
+            self.columns.push_back(Column::Stack(items));
+        } else {
+            self.columns.insert(index, Column::Stack(items));
+        }
+        _ = self.toggle_tabbed_display(active);
+    }
+
+    /// Appends `entities` as a tabbed-display `Column::Stack`.
+    pub fn append_tabbed_stack(&mut self, entities: &[Entity], active: Entity) {
+        self.insert_tabbed_stack_at(self.len(), entities, active);
+    }
+
+    /// Inserts `entity` (or its [`RelocationGroup`], if any) at `index`.
+    pub fn insert_relocation_group_at(
+        &mut self,
+        index: usize,
+        entity: Entity,
+        group: Option<&RelocationGroup>,
+    ) {
+        match group {
+            Some(RelocationGroup::NativeTabs(members)) => self.insert_tab_group_at(index, members),
+            Some(RelocationGroup::TabbedStack { members, active }) => {
+                self.insert_tabbed_stack_at(index, members, *active);
+            }
+            None => self.insert_at(index, entity),
+        }
+    }
+
+    /// Appends `entity` (or its [`RelocationGroup`], if any) to the end of the strip.
+    pub fn append_relocation_group(&mut self, entity: Entity, group: Option<&RelocationGroup>) {
+        match group {
+            Some(RelocationGroup::NativeTabs(members)) => self.append_tab_group(members),
+            Some(RelocationGroup::TabbedStack { members, active }) => {
+                self.append_tabbed_stack(members, *active);
+            }
+            None => self.append(entity),
+        }
+    }
+
     /// Toggles tabbed display (one window visible at a time, sharing the
     /// full column rect) for the `Column::Stack` containing `entity`.
     /// Returns `None` — not applicable, nothing changed — unless `entity` is
@@ -999,28 +1304,66 @@ impl LayoutStrip {
     /// call — when the toggle actually applied.
     pub fn toggle_tabbed_display(&mut self, entity: Entity) -> Option<bool> {
         let index = self.index_of(entity).ok()?;
-        let Column::Stack(items) = self.get(index).ok()? else {
+        let Column::Stack(items) = self.columns.get(index)? else {
             return None;
         };
         if items.len() < 2 {
             return None;
         }
-        let members: Vec<Entity> = items.iter().flat_map(StackItem::window_iter).collect();
-        let now_tabbed = !members.iter().any(|e| self.tabbed_stacks.contains(e));
-        if now_tabbed {
-            self.tabbed_stacks.extend(members);
-        } else {
-            for member in members {
+        let now_tabbed = !self.tabbed_stacks.contains_key(&entity);
+        for member in items.iter().flat_map(StackItem::window_iter) {
+            if now_tabbed {
+                // `entity` becomes the initially visible tab.
+                self.tabbed_stacks.insert(member, entity);
+            } else {
                 self.tabbed_stacks.remove(&member);
             }
         }
         Some(now_tabbed)
     }
 
+    /// Whether any `Column::Stack` in this strip is currently displayed as tabs.
+    pub fn has_tabbed_stacks(&self) -> bool {
+        !self.tabbed_stacks.is_empty()
+    }
+
     /// Whether `entity` belongs to a `Column::Stack` currently displayed as
     /// tabs. Independent of `tabbed()` (native-OS-tab detection).
     pub fn is_tabbed_display(&self, entity: Entity) -> bool {
-        self.tabbed_stacks.contains(&entity)
+        self.tabbed_stacks.contains_key(&entity)
+    }
+
+    /// The currently visible tab for `entity`'s tabbed group, or `None` if
+    /// `entity` isn't part of one.
+    pub fn active_tab(&self, entity: Entity) -> Option<Entity> {
+        self.tabbed_stacks.get(&entity).copied()
+    }
+
+    /// Whether `entity` is an inactive (parked, off-screen) tab. macOS can
+    /// misattribute a parked tab to a neighbouring display/Space, so
+    /// move-detection should ignore such windows.
+    pub fn is_parked_tab(&self, entity: Entity) -> bool {
+        self.tabbed_stacks
+            .get(&entity)
+            .is_some_and(|&active| active != entity)
+    }
+
+    /// Makes `entity` its group's visible tab. Returns `false` if it isn't
+    /// tabbed or is already active.
+    pub fn set_active_tab(&mut self, entity: Entity) -> bool {
+        if !self.is_parked_tab(entity) {
+            return false;
+        }
+        let Ok(index) = self.index_of(entity) else {
+            return false;
+        };
+        let Some(Column::Stack(items)) = self.columns.get(index) else {
+            return false;
+        };
+        for member in items.iter().flat_map(StackItem::window_iter) {
+            self.tabbed_stacks.insert(member, entity);
+        }
+        true
     }
 
     /// Given `entity` in a tabbed `Column::Stack`, returns the next tab,
@@ -1119,7 +1462,10 @@ fn binpack_heights(heights: &[i32], min_height: i32, total_height: i32) -> Optio
 
 /// Watches for size changes to windows and if they are changed, signals to the layout strip.
 #[instrument(level = Level::DEBUG, skip_all)]
-fn layout_sizes_changed(changed_sizes: ResizedWindows, workspaces: Query<&mut LayoutStrip>) {
+pub(super) fn layout_sizes_changed(
+    changed_sizes: ResizedWindows,
+    workspaces: Query<&mut LayoutStrip>,
+) {
     let changed_entities = changed_sizes.iter().collect::<EntityHashSet>();
     workspaces.into_iter().for_each(|mut strip| {
         if strip_has_changed_window(&strip, &changed_entities) {
@@ -1159,7 +1505,7 @@ fn stack_item_has_changed_window(item: &StackItem, changed_entities: &EntityHash
 /// Watches for changes to `LayoutStrip` (i.e. a window added or window order changed) and
 /// re-calculates the logical positions of all the windows in the layout strip.
 #[instrument(level = Level::DEBUG, skip_all)]
-fn layout_strip_changed(
+pub(super) fn layout_strip_changed(
     changed_strips: Populated<(&LayoutStrip, &ChildOf), Changed<LayoutStrip>>,
     mut windows: WindowFrames,
     displays: DisplayViewports,
@@ -1168,7 +1514,10 @@ fn layout_strip_changed(
     let get_window_frame = |entity| {
         windows
             .get(entity)
-            .map(|(position, bounds, _)| IRect::from_corners(position.0, position.0 + bounds.0))
+            .map(|(position, bounds, _, resize)| {
+                let size = resize.map_or(bounds.0, |resize| resize.0);
+                IRect::from_corners(position.0, position.0 + size)
+            })
             .ok()
     };
 
@@ -1187,22 +1536,67 @@ fn layout_strip_changed(
         .collect::<Vec<_>>();
 
     for (entity, frame) in changed {
-        if let Ok((_, mut bounds, mut layout_position)) = windows.get_mut(entity) {
-            if layout_position.0 != frame.min {
+        if let Ok((_, mut bounds, mut layout_position, resize)) = windows.get_mut(entity) {
+            if layout_position.0 == frame.min {
+                layout_position.set_changed();
+            } else {
                 layout_position.0 = frame.min;
             }
-            if bounds.0 != frame.size() {
+            if let Some(mut resize) = resize {
+                if resize.0 != frame.size() {
+                    resize.0 = frame.size();
+                }
+            } else if bounds.0 != frame.size() {
                 bounds.0 = frame.size();
             }
         }
     }
 }
 
+/// Resolved owning strip and display viewport for a window entity participating
+/// in [`reshuffle_layout_strip`] or [`ensure_visible_in_strip`].
+struct StripScrollContext<'a> {
+    strip: &'a LayoutStrip,
+    strip_entity: Entity,
+    strip_origin: Origin,
+    strip_target: Origin,
+    display_bounds: IRect,
+    raw_display_bounds: IRect,
+    is_new_activation: bool,
+}
+
+fn resolve_strip_scroll_context<'a>(
+    entity: Entity,
+    strips: &'a StripPlacements,
+    displays: &DisplayViewports,
+    config: &Config,
+) -> Option<StripScrollContext<'a>> {
+    let (strip, strip_entity, strip_position, child, strip_reposition, has_previous_position) =
+        strips.into_iter().find(|strip| strip.0.contains(entity))?;
+    let (display, dock) = displays.get(child.parent()).ok()?;
+    let strip_target = strip_reposition.map_or(strip_position.0, |reposition| reposition.0);
+    Some(StripScrollContext {
+        strip,
+        strip_entity,
+        strip_origin: strip_position.0,
+        strip_target,
+        display_bounds: display.actual_display_bounds(dock, config),
+        raw_display_bounds: display.bounds(),
+        // A strip with `PreviousStripPosition` is either parked off-screen or
+        // on the first tick of activation (before `show_active_workspace`
+        // removes the component), so layout reshuffles must not pull it onto
+        // the visible viewport.
+        is_new_activation: has_previous_position,
+    })
+}
+
 #[instrument(level = Level::DEBUG, skip_all)]
-fn reshuffle_layout_strip(
-    markers: Query<(Entity, &LayoutPosition), With<ReshuffleAroundMarker>>,
+#[allow(clippy::too_many_arguments)]
+pub(super) fn reshuffle_layout_strip(
+    markers: ReshuffleMarkers,
     strips: StripPlacements,
     manual_offsets: Query<&ManualStripOffset>,
+    anchors: Query<&ResizeAnchor>,
     displays: DisplayViewports,
     windows: Windows,
     config: Res<Config>,
@@ -1211,27 +1605,39 @@ fn reshuffle_layout_strip(
     markers.into_iter().for_each(|(entity, layout_position)| {
         if let Ok(mut cmd) = commands.get_entity(entity) {
             cmd.try_remove::<ReshuffleAroundMarker>();
+            if !windows.is_resizing(entity) {
+                cmd.try_remove::<ResizeAnchor>();
+            }
         }
-        let Some((strip, strip_entity, active_strip, child, active_marker, strip_reposition)) =
-            strips.into_iter().find(|strip| strip.0.contains(entity))
-        else {
+        let Some(ctx) = resolve_strip_scroll_context(entity, &strips, &displays, &config) else {
             return;
         };
-
-        if active_marker.is_some_and(|m| m.is_added()) {
-            trace!("reshuffle_layout_strip: skipping newly active workspace {strip_entity}");
+        if ctx.is_new_activation {
+            trace!(
+                "reshuffle_layout_strip: skipping newly active workspace {}",
+                ctx.strip_entity
+            );
             return;
         }
-        let Ok((active_display, dock)) = displays.get(child.parent()) else {
+        let Some(frame) = windows.moving_frame(entity) else {
             return;
         };
-        let display_bounds = active_display.actual_display_bounds(dock, &config);
-        let Some(mut frame) = windows.moving_frame(entity) else {
-            return;
-        };
-
         let size = frame.size();
-        let visible_width = display_bounds.intersect(frame).width();
+        // When a window is being resized (`ResizeMarker` present), keep its
+        // visual center anchored (its `ResizeAnchor`) unless `auto_center` or the
+        // edge invariant overrides it; for non-resize reshuffles, project from
+        // its logical slot in the strip (`layout_position.0 + strip_target`).
+        let resizing = windows.is_resizing(entity) || anchors.contains(entity);
+        let resize_center = anchors
+            .get(entity)
+            .map(|anchor| anchor.0)
+            .ok()
+            .or_else(|| windows.frame(entity).map(|frame| frame.center().x));
+
+        let display_bounds = ctx.display_bounds;
+        let projected_min = layout_position.0 + ctx.strip_target;
+        let projected_frame = IRect::from_corners(projected_min, projected_min + size);
+        let visible_width = display_bounds.intersect(projected_frame).width();
 
         // A deliberate offset (center, snap) outranks the derived one, but only
         // while the window this reshuffle is about is still fully on screen: a
@@ -1239,40 +1645,52 @@ fn reshuffle_layout_strip(
         // and at that point the placement is stale. Project against the strip's
         // *target* offset — mid-animation the window's own frame is a tick
         // behind a strip that is still moving.
-        if let Ok(manual) = manual_offsets.get(strip_entity) {
+        if let Ok(manual) = manual_offsets.get(ctx.strip_entity) {
             // The offset only ever meant "the user placed *this* layout here",
             // so a strip that has since gained, lost, reordered or resized a
             // column no longer has a placement to keep.
-            let current = strip_signature(strip, &windows);
-            let strip_target = strip_reposition.map_or(active_strip.0, |reposition| reposition.0);
-            let projected = layout_position.0 + strip_target;
-            if signature_matches(&current, &manual.signature)
-                && clamp_origin_to_viewport(projected, size, display_bounds) == projected
+            let current = strip_signature(ctx.strip, &windows);
+            if !resizing
+                && signature_matches(&current, &manual.signature)
+                && clamp_origin_to_viewport(projected_min, size, display_bounds) == projected_min
             {
-                trace!("reshuffle_layout_strip: keeping manual offset on {strip_entity}");
+                trace!(
+                    "reshuffle_layout_strip: keeping manual offset on {}",
+                    ctx.strip_entity
+                );
                 return;
             }
-            trace!("reshuffle_layout_strip: manual offset on {strip_entity} is stale");
-            if let Ok(mut cmd) = commands.get_entity(strip_entity) {
+            trace!(
+                "reshuffle_layout_strip: manual offset on {} is stale",
+                ctx.strip_entity
+            );
+            if let Ok(mut cmd) = commands.get_entity(ctx.strip_entity) {
                 cmd.try_remove::<ManualStripOffset>();
             }
         }
 
-        // Expose the window by clamping it into the viewport.
-        frame.min = clamp_origin_to_viewport(frame.min, size, display_bounds);
-        frame.max = frame.min + size;
+        // Derive the window's target origin: centered horizontally when
+        // auto_center is enabled, centered around its current frame when
+        // resizing in place, or clamped into the viewport from its logical slot
+        // in the strip.
+        let mut desired_min = projected_min;
+        if config.auto_center() {
+            desired_min.x = ctx.raw_display_bounds.center().x - size.x / 2;
+        } else if resizing && let Some(center) = resize_center {
+            desired_min.x = center - size.x / 2;
+        }
+        let clamped_min = clamp_origin_to_viewport(desired_min, size, display_bounds);
 
-        let mut strip_position = (frame.min - layout_position.0).with_y(display_bounds.min.y);
+        let mut strip_position = (clamped_min - layout_position.0).with_y(display_bounds.min.y);
 
         // Enforce the edge invariant when auto-center is off: the leftmost
         // window must touch the left edge and the rightmost the right edge
         // if more than 1 windows in workspace.
         if !config.auto_center()
             && !config.continuous_swipe()
-            && let Some(total_strip_width) = strip
+            && let Some(total_strip_width) = ctx
+                .strip
                 .last()
-                .ok()
-                .and_then(|column| column.top())
                 .and_then(|last| {
                     windows
                         .layout_position(last)
@@ -1292,25 +1710,27 @@ fn reshuffle_layout_strip(
             };
         }
 
-        // Check how much of the window is hidden. Slivers don't count as
-        // meaningfully visible, so subtract sliver_width from the visible
-        // portion. If the hidden fraction is within the allowed ratio, skip.
+        // Check how much of the window is hidden. If the hidden fraction is
+        // within the allowed ratio (and we are not resizing it), skip.
         let hidden_ratio = config.window_hidden_ratio();
-        if hidden_ratio > 0.0 {
-            let meaningful = (visible_width - config.sliver_width()).max(0);
-            let visible_fraction = f64::from(meaningful) / f64::from(frame.width().max(1));
+        if !resizing && hidden_ratio > 0.0 {
+            let visible_fraction = f64::from(visible_width) / f64::from(size.x.max(1));
             let hidden_fraction = 1.0 - visible_fraction;
 
             // Do not move the window if the hidden fraction is lower than threshold
             // or if the layout strip movement is shorter than the hidden width.
-            let strip_movement = (active_strip.x - strip_position.x).abs();
-            if hidden_fraction <= hidden_ratio && frame.width() - visible_width >= strip_movement {
+            // A window with nothing in view always moves, even at a ratio of 1.0.
+            let strip_movement = (ctx.strip_origin.x - strip_position.x).abs();
+            if visible_width > 0
+                && hidden_fraction <= hidden_ratio
+                && size.x - visible_width >= strip_movement
+            {
                 return;
             }
         }
 
         trace!("reshuffle_layout_strip: triggered for entity {entity}, offset {strip_position}");
-        commands.reposition_entity(strip_entity, strip_position);
+        commands.reposition_entity(ctx.strip_entity, strip_position);
     });
 }
 
@@ -1343,18 +1763,14 @@ fn ensure_visible_in_strip(
         // before the `&mut Position` query below is touched — Bevy treats
         // the two queries as conflicting system params even though they're
         // never live at the same time here.
-        let Some((strip_entity, display_entity, strip_target, is_new_activation)) = strip_params
-            .p0()
-            .into_iter()
-            .find(|s| s.0.contains(entity))
-            .map(
-                |(_, strip_entity, strip_position, child, active_marker, strip_reposition)| {
-                    let target = strip_reposition.map_or(strip_position.0, |r| r.0);
+        let Some((strip_entity, strip_target, viewport, is_new_activation)) =
+            resolve_strip_scroll_context(entity, &strip_params.p0(), &displays, &config).map(
+                |ctx| {
                     (
-                        strip_entity,
-                        child.parent(),
-                        target,
-                        active_marker.is_some_and(|m| m.is_added()),
+                        ctx.strip_entity,
+                        ctx.strip_target,
+                        ctx.display_bounds,
+                        ctx.is_new_activation,
                     )
                 },
             )
@@ -1366,29 +1782,18 @@ fn ensure_visible_in_strip(
             trace!("ensure_visible_in_strip: skipping newly active workspace {strip_entity}");
             continue;
         }
-        let Ok((display, dock)) = displays.get(display_entity) else {
-            continue;
-        };
         let Some(size) = windows.size(entity) else {
             continue;
         };
-        let viewport = display.actual_display_bounds(dock, &config);
 
         // Where the entity would appear once the strip settles. Mid-animation
         // the strip's current position is on its way somewhere else, so the
         // target offset is what the window's slot will actually be measured
         // against - the same projection `reshuffle_layout_strip` makes.
-        let candidate_min = layout_position.0 + strip_target;
-        // Clamp into the viewport. If already on-screen, this is a no-op and
-        // the strip target equals its current position — no movement.
-        let clamped_min = clamp_origin_to_viewport(candidate_min, size, viewport);
-        if clamped_min == candidate_min {
+        let scroll_to = origin_exposing(layout_position.0, size, strip_target, viewport);
+        if scroll_to == strip_target {
             continue;
         }
-        // Both axes come from the clamp: it is still the minimum shortfall, and
-        // keeping the strip's own y here would silently drop the vertical
-        // correction for a window sitting above the menu bar.
-        let scroll_to = clamped_min - layout_position.0;
         trace!("ensure_visible_in_strip: entity {entity}, scroll strip to {scroll_to}");
         // Scrolling to expose a window overrides whatever the user placed here.
         if let Ok(mut cmd) = commands.get_entity(strip_entity) {
@@ -1412,15 +1817,15 @@ fn ensure_visible_in_strip(
     }
 }
 
-/// Reacts to changes in the position of the `LayoutStrip` to Display, and if changed,
+/// Reacts to changes in the position or target offset of the `LayoutStrip`, and
 /// marks all the windows in the strip as requiring re-positioning.
 #[instrument(level = Level::DEBUG, skip_all)]
 fn position_layout_strips(
-    moved_strips: Populated<&LayoutStrip, Changed<Position>>,
+    moved_strips: MovedStrips,
     mut windows: Query<&mut LayoutPosition, (With<Window>, Without<LayoutStrip>)>,
 ) {
     for strip in moved_strips {
-        for entity in strip.all_windows() {
+        for entity in strip.window_iter() {
             if let Ok(mut position) = windows.get_mut(entity) {
                 position.set_changed();
             }
@@ -1429,6 +1834,7 @@ fn position_layout_strips(
 }
 
 #[derive(Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)]
 struct StripWindowContext {
     strip_position: Origin,
     swiping: bool,
@@ -1438,9 +1844,12 @@ struct StripWindowContext {
     /// snap directly to its target in `position_layout_windows`, bypassing
     /// the offscreen/parking magnitude heuristic.
     snap_settling: bool,
+    /// Member of a tabbed-display stack.
+    tabbed_display: bool,
+    /// Inactive tab; parked off-screen horizontally like a scrolled-off column.
+    parked_tab: bool,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn insert_strip_window_contexts(
     contexts: &mut EntityHashMap<StripWindowContext>,
     strip: &LayoutStrip,
@@ -1450,107 +1859,24 @@ fn insert_strip_window_contexts(
     snap_settling: bool,
 ) {
     for column in &strip.columns {
-        insert_column_window_contexts(
-            contexts,
-            column,
-            strip_position,
-            swiping,
-            display_entity,
-            matches!(column, Column::Stack(_)),
-            snap_settling,
-        );
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn insert_column_window_contexts(
-    contexts: &mut EntityHashMap<StripWindowContext>,
-    column: &Column,
-    strip_position: Origin,
-    swiping: bool,
-    display_entity: Entity,
-    stacked: bool,
-    snap_settling: bool,
-) {
-    match column {
-        Column::Single(entity) | Column::Fullscren(entity) => {
+        let stacked = matches!(column, Column::Stack(_));
+        let active_tab = stacked
+            .then(|| column.top().and_then(|top| strip.active_tab(top)))
+            .flatten();
+        let tabbed_display = active_tab.is_some();
+        for entity in column.window_iter() {
             contexts.insert(
-                *entity,
+                entity,
                 StripWindowContext {
                     strip_position,
                     swiping,
                     display_entity,
                     stacked,
                     snap_settling,
+                    tabbed_display,
+                    parked_tab: active_tab.is_some_and(|active| active != entity),
                 },
             );
-        }
-        Column::Stack(items) => {
-            for item in items {
-                insert_stack_item_window_contexts(
-                    contexts,
-                    item,
-                    strip_position,
-                    swiping,
-                    display_entity,
-                    stacked,
-                    snap_settling,
-                );
-            }
-        }
-        Column::Tabs(entities) => {
-            for entity in entities {
-                contexts.insert(
-                    *entity,
-                    StripWindowContext {
-                        strip_position,
-                        swiping,
-                        display_entity,
-                        stacked,
-                        snap_settling,
-                    },
-                );
-            }
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn insert_stack_item_window_contexts(
-    contexts: &mut EntityHashMap<StripWindowContext>,
-    item: &StackItem,
-    strip_position: Origin,
-    swiping: bool,
-    display_entity: Entity,
-    stacked: bool,
-    snap_settling: bool,
-) {
-    match item {
-        StackItem::Single(entity) => {
-            contexts.insert(
-                *entity,
-                StripWindowContext {
-                    strip_position,
-                    swiping,
-                    display_entity,
-                    stacked,
-                    snap_settling,
-                },
-            );
-        }
-        StackItem::Tabs(entities) => {
-            for entity in entities {
-                contexts.insert(
-                    *entity,
-                    StripWindowContext {
-                        strip_position,
-                        swiping,
-                        display_entity,
-                        stacked,
-                        snap_settling,
-                    },
-                );
-            }
         }
     }
 }
@@ -1569,24 +1895,29 @@ fn position_layout_windows(
     let offscreen_sliver_width = config.sliver_width();
     let (_, pad_right, _, pad_left) = config.edge_padding();
     let mut strip_contexts = EntityHashMap::default();
-    for (strip_entity, layout_strip, Position(strip_position), swiping, child_of) in &workspaces {
+    for (strip_entity, layout_strip, Position(strip_position), reposition, swiping, child_of) in
+        &workspaces
+    {
         let snap_settling = snap_guards.iter().any(|guard| guard.strip == strip_entity);
+        let strip_target = reposition.map_or(*strip_position, |target| target.0);
         insert_strip_window_contexts(
             &mut strip_contexts,
             layout_strip,
-            *strip_position,
+            strip_target,
             swiping,
             child_of.parent(),
             snap_settling,
         );
     }
 
-    for (entity, window, layout_position, mut position, mut bounds) in positioned_windows {
+    for (entity, window, layout_position, mut position, mut bounds, resize, was_parked_tab) in
+        positioned_windows
+    {
         let Some(context) = strip_contexts.get(&entity) else {
-            return;
+            continue;
         };
         let Ok((display, dock)) = displays.get(context.display_entity) else {
-            return;
+            continue;
         };
         let viewport = display.actual_display_bounds(dock, &config);
         // Gets 80% of the display height as threshold.
@@ -1598,24 +1929,23 @@ fn position_layout_windows(
         // h_pad to the virtual x, so subtract it here so the OS window
         // lands exactly sliver_width pixels from the screen edge.
         let h_pad = window.horizontal_padding();
-        let mut frame = IRect::from_corners(layout_position.0, layout_position.0 + bounds.0);
+        let target_size = resize.map_or(bounds.0, |resize| resize.0);
+        let mut frame = IRect::from_corners(layout_position.0, layout_position.0 + target_size);
         let width = frame.width();
         frame.min += context.strip_position;
         frame.max += context.strip_position;
 
         let mut offscreen = false;
-        if frame.max.x <= viewport.min.x + h_pad {
-            // Window hidden to the left — position so exactly
-            // sliver_width CG pixels are visible from the real
-            // display edge.  The +h_pad accounts for the gap that
-            // reposition() adds, which can leave a window just
-            // inside the viewport edge while its CG frame is fully
-            // past it.
-            frame.min.x = viewport.min.x - width + offscreen_sliver_width - pad_left + h_pad;
-            offscreen = true;
-        } else if frame.min.x >= viewport.max.x - h_pad {
-            // Window hidden to the right — mirror of above.
+        if context.parked_tab || frame.min.x >= viewport.max.x - h_pad {
+            // Park inactive tabs to the side (not below, where a display
+            // underneath would adopt them), and position windows hidden past
+            // the right edge so sliver_width CG pixels remain visible.
             frame.min.x = viewport.max.x - offscreen_sliver_width + pad_right - h_pad;
+            offscreen = true;
+        } else if frame.max.x <= viewport.min.x + h_pad {
+            // Window hidden to the left — mirror of above. The +h_pad accounts
+            // for the gap that reposition() adds.
+            frame.min.x = viewport.min.x - width + offscreen_sliver_width - pad_left + h_pad;
             offscreen = true;
         }
         frame.max.x = frame.min.x + width;
@@ -1623,18 +1953,13 @@ fn position_layout_windows(
         // During swipe, keep full height. The vertical sliver inset only
         // applies to horizontally off-screen windows, so they expose just
         // a `sliver_height` fraction of their height at the viewport's
-        // vertical center.
-        if !context.swiping && offscreen {
-            // Don't compress stacked windows vertically when off-screen.
-            // The height reduction corrupts their proportions: when the
-            // column scrolls back on-screen, binpack_heights makes the
-            // last window absorb all remaining space.
-            if !context.stacked {
-                let inset =
-                    round_px(f64::from(viewport.height()) * (1.0 - config.sliver_height()) / 2.0);
-                frame.min.y += inset;
-                frame.max.y += inset;
-            }
+        // vertical center. Don't compress stacked windows vertically when
+        // off-screen, or binpack_heights would corrupt their proportions.
+        if !context.swiping && offscreen && !context.stacked {
+            let inset =
+                round_px(f64::from(viewport.height()) * (1.0 - config.sliver_height()) / 2.0);
+            frame.min.y += inset;
+            frame.max.y += inset;
         }
 
         // Keep the window anchored to its own display. The parked strip origin
@@ -1650,8 +1975,26 @@ fn position_layout_windows(
             frame.max.y = park_row + height;
         }
 
-        if bounds.0 != frame.size() {
-            bounds.0 = frame.size();
+        if resize.is_none() {
+            if bounds.0 != frame.size() {
+                bounds.0 = frame.size();
+            } else if !context.parked_tab && was_parked_tab {
+                bounds.set_changed();
+            }
+        }
+
+        let tab_snap = context.parked_tab
+            || was_parked_tab
+            || (context.tabbed_display && position.0.y != frame.min.y);
+        if context.parked_tab {
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<RepositionMarker>();
+                if !was_parked_tab {
+                    entity_commands.try_insert(ParkedTabMarker);
+                }
+            }
+        } else if was_parked_tab && let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<(ParkedTabMarker, RepositionMarker)>();
         }
 
         if position.0 != frame.min {
@@ -1659,12 +2002,12 @@ fn position_layout_windows(
             //   - The user is actively swiping: windows must track the finger in lockstep.
             //   - A workspace switch just moved the strip vertically: jumping the full off-screen
             //   distance should be instantaneous.
+            //   - A tab is being parked/unparked or switching inside a tabbed stack (`tab_snap`).
             // Otherwise (programmatic strip animation, or pure layout change), animate toward the
-            // new position so layout changes (swap/add/remove) slide instead of teleport. When the
-            // strip is also being animated, the per-window target is recomputed each tick from the
-            // strip's current position, so the two motions compose: e.g., on swap, the focused
-            // window's target converges back to its old visual position as the strip settles, while
-            // the other window slides past.
+            // new position so layout changes (swap/add/remove/center) slide instead of teleport.
+            // When the strip is also being animated, the per-window target is recomputed each tick
+            // from the strip's target position, so the active tab of a tabbed stack eases into
+            // place alongside surrounding columns.
             // Parking and un-parking have to snap as one move. The clamp above
             // leaves the lower stack members a short hop from their visible
             // slot, which the distance threshold alone reads as an ordinary
@@ -1681,6 +2024,7 @@ fn position_layout_windows(
             // to its target. See `SnapStripMarker`.
             if context.swiping
                 || context.snap_settling
+                || tab_snap
                 || offscreen_move && !config.virtual_workspace_animations()
             {
                 position.0 = frame.min;
@@ -1698,6 +2042,149 @@ fn position_layout_windows(
 mod tests {
     use super::*;
     use bevy::prelude::*;
+
+    fn harness_with_orphaned_display() -> crate::tests::TestHarness {
+        use std::time::Duration;
+
+        use crate::events::Event;
+        use crate::tests::{
+            EXT_DISPLAY_HEIGHT, EXT_DISPLAY_ID, EXT_DISPLAY_WIDTH, EXT_WORKSPACE_ID,
+            TEST_DISPLAY_HEIGHT, TEST_DISPLAY_ID, TEST_DISPLAY_WIDTH, TEST_WORKSPACE_ID,
+            TestHarness,
+        };
+
+        let mut harness = TestHarness::new()
+            .with_display(
+                EXT_DISPLAY_ID,
+                IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+                vec![EXT_WORKSPACE_ID],
+            )
+            .with_workspace_window(100, EXT_WORKSPACE_ID, |_| {})
+            .with_window(0, |_| {});
+        // Make the external display active, matching a disconnection while
+        // one of its windows is focused.
+        harness.mock_state.remove_display(TEST_DISPLAY_ID);
+        harness.mock_state.remove_display(EXT_DISPLAY_ID);
+        harness.mock_state.add_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        );
+        harness.mock_state.add_display(
+            TEST_DISPLAY_ID,
+            IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+            vec![TEST_WORKSPACE_ID],
+        );
+        harness.advance(Duration::from_millis(500));
+
+        harness.mock_state.remove_display(EXT_DISPLAY_ID);
+        harness
+            .world()
+            .write_message::<Event>(Event::DisplayRemoved {
+                display_id: EXT_DISPLAY_ID,
+            });
+        harness.advance(Duration::from_millis(650));
+        harness
+    }
+
+    #[test]
+    fn orphaned_window_does_not_block_other_display_positions() {
+        use bevy::ecs::change_detection::DetectChangesMut;
+
+        use crate::tests::{EXT_WORKSPACE_ID, TEST_WORKSPACE_ID, find_window_entity};
+
+        let mut harness = harness_with_orphaned_display();
+
+        // Keep one system instance so its Changed<LayoutPosition> filter sees
+        // only the changes below, as it would in the normal schedule.
+        let layout_system = harness.world().register_system(position_layout_windows);
+        harness.world().run_system(layout_system).unwrap();
+
+        let orphan = find_window_entity(100, harness.world());
+        let survivor = find_window_entity(0, harness.world());
+        let survivor_strip = harness
+            .world()
+            .query::<(&LayoutStrip, Entity)>()
+            .iter(harness.world())
+            .find(|(strip, _)| strip.id() == TEST_WORKSPACE_ID)
+            .unwrap()
+            .1;
+        harness
+            .world()
+            .get_mut::<Position>(survivor_strip)
+            .unwrap()
+            .0
+            .x += 80;
+        harness
+            .world()
+            .entity_mut(survivor)
+            .remove::<RepositionMarker>();
+        harness
+            .world()
+            .get_mut::<LayoutPosition>(orphan)
+            .unwrap()
+            .set_changed();
+        harness
+            .world()
+            .get_mut::<LayoutPosition>(survivor)
+            .unwrap()
+            .set_changed();
+        harness.world().run_system(layout_system).unwrap();
+
+        assert_eq!(
+            harness
+                .world()
+                .get::<RepositionMarker>(survivor)
+                .map(|marker| marker.0),
+            Some(Origin::new(80, 20)),
+            "an orphaned window must not stop another display's layout update"
+        );
+
+        // A strip may also retain a parent whose display entity is no longer
+        // available while reconciliation is in flight.
+        let orphan_strip = harness
+            .world()
+            .query::<(&LayoutStrip, Entity)>()
+            .iter(harness.world())
+            .find(|(strip, _)| strip.id() == EXT_WORKSPACE_ID)
+            .unwrap()
+            .1;
+        let stale_parent = harness.world().spawn_empty().id();
+        harness
+            .world()
+            .entity_mut(orphan_strip)
+            .insert(ChildOf(stale_parent));
+        harness
+            .world()
+            .get_mut::<Position>(survivor_strip)
+            .unwrap()
+            .0
+            .x += 40;
+        harness
+            .world()
+            .entity_mut(survivor)
+            .remove::<RepositionMarker>();
+        harness
+            .world()
+            .get_mut::<LayoutPosition>(orphan)
+            .unwrap()
+            .set_changed();
+        harness
+            .world()
+            .get_mut::<LayoutPosition>(survivor)
+            .unwrap()
+            .set_changed();
+        harness.world().run_system(layout_system).unwrap();
+
+        assert_eq!(
+            harness
+                .world()
+                .get::<RepositionMarker>(survivor)
+                .map(|marker| marker.0),
+            Some(Origin::new(120, 20)),
+            "a stale display parent must not stop another display's layout update"
+        );
+    }
 
     #[test]
     fn signature_tolerates_pixel_drift_but_not_a_reshape() {
@@ -1777,6 +2264,20 @@ mod tests {
         strip.append(entities[2]);
 
         (world, strip, entities)
+    }
+
+    #[test]
+    fn stack_leaves_a_fullscreen_column_and_its_neighbour_in_place() {
+        let mut world = World::new();
+        let entities = world.spawn_batch(vec![(), ()]).collect::<Vec<Entity>>();
+        let mut strip = LayoutStrip::fullscreen(1, entities[0]);
+        strip.append(entities[1]);
+
+        strip.stack(entities[1]).unwrap();
+
+        assert_eq!(strip.len(), 2);
+        assert!(strip.is_fullscreen());
+        assert_eq!(strip.index_of(entities[1]).unwrap(), 1);
     }
 
     #[test]
@@ -1869,6 +2370,79 @@ mod tests {
         assert_eq!(strip.index_of(entities[1]).unwrap(), 0);
         assert_eq!(strip.index_of(entities[0]).unwrap(), 1);
         assert_eq!(strip.index_of(entities[2]).unwrap(), 2);
+    }
+
+    /// `consume` is the mirror of `stack` in the opposite direction: the
+    /// acting entity's own column survives at its position, the neighbor
+    /// to its *right* disappears into it, and the acting entity's own
+    /// item(s) stay on top (the consumed neighbor's items join the bottom).
+    #[test]
+    fn test_window_pane_consume() {
+        let (_world, mut strip, entities) = setup_world_and_strip();
+
+        // [0] consumes [1] (its right neighbor).
+        strip.consume(entities[0]).unwrap();
+        assert_eq!(strip.len(), 2);
+        assert_eq!(strip.index_of(entities[0]).unwrap(), 0);
+        assert_eq!(strip.index_of(entities[1]).unwrap(), 0); // Both in the same panel
+        assert_eq!(strip.index_of(entities[2]).unwrap(), 1);
+
+        match strip.get(0).unwrap() {
+            Column::Stack(stack) => {
+                assert_eq!(stack.len(), 2);
+                assert_eq!(
+                    stack[0],
+                    StackItem::Single(entities[0]),
+                    "consumer stays on top"
+                );
+                assert_eq!(
+                    stack[1],
+                    StackItem::Single(entities[1]),
+                    "the consumed neighbor joins the bottom"
+                );
+            }
+            Column::Single(_) | Column::Fullscren(_) | Column::Tabs(_) => {
+                panic!("Expected a stack")
+            }
+        }
+    }
+
+    #[test]
+    fn test_consume_is_a_noop_with_no_right_neighbor() {
+        let (_world, mut strip, entities) = setup_world_and_strip();
+
+        // entities[2] is the last column — nothing to its right.
+        strip.consume(entities[2]).unwrap();
+        assert_eq!(strip.len(), 3);
+        assert_eq!(strip.index_of(entities[0]).unwrap(), 0);
+        assert_eq!(strip.index_of(entities[1]).unwrap(), 1);
+        assert_eq!(strip.index_of(entities[2]).unwrap(), 2);
+    }
+
+    /// Regression guard: `stack` removes both the mover's and the target's
+    /// columns from `self.columns` before checking whether either is
+    /// `Column::Fullscren`, and (per investigation) would silently drop
+    /// them from the strip forever if that branch were ever hit. `consume`
+    /// must not reproduce that landmine — it must recognize a Fullscreen
+    /// column on either side and refuse to touch anything.
+    #[test]
+    fn test_consume_never_drops_a_fullscreen_column() {
+        let (_world, mut strip, entities) = setup_world_and_strip();
+        // Directly overwrite entities[1]'s column with a Fullscreen one —
+        // not reachable through any real caller today (`Column::Fullscren`
+        // only ever occupies a strip alone), but `consume` must still be
+        // defensive rather than rely on that invariant holding forever.
+        strip.columns[1] = Column::Fullscren(entities[1]);
+
+        // Neighbor (index + 1) is Fullscreen.
+        strip.consume(entities[0]).unwrap();
+        assert_eq!(strip.len(), 3, "no column may be lost");
+        assert!(matches!(strip.get(1).unwrap(), Column::Fullscren(_)));
+
+        // Own column is Fullscreen.
+        strip.consume(entities[1]).unwrap();
+        assert_eq!(strip.len(), 3, "no column may be lost");
+        assert!(matches!(strip.get(1).unwrap(), Column::Fullscren(_)));
     }
 
     #[test]
@@ -2057,7 +2631,42 @@ mod tests {
     }
 
     #[test]
-    fn test_tabbed_stack_shares_full_column_frame() {
+    fn test_tabbed_stack_shows_active_and_parks_the_rest() {
+        let mut world = World::new();
+        let entities = world.spawn_batch(vec![(), (), ()]).collect::<Vec<Entity>>();
+
+        let mut strip = LayoutStrip::default();
+        for &e in &entities {
+            strip.append(e);
+        }
+        strip.stack(entities[1]).unwrap();
+        strip.stack(entities[2]).unwrap();
+        // Toggling on entities[1] makes it the initially active tab.
+        strip.toggle_tabbed_display(entities[1]);
+
+        let get_window_frame = |_| Some(IRect::new(0, 0, 400, 300));
+        let out: Vec<_> = strip.relative_positions(700, &get_window_frame).collect();
+
+        assert_eq!(out.len(), 3);
+        for (_, frame) in &out {
+            assert_eq!(
+                frame.height(),
+                700,
+                "every tab must fill the full column height"
+            );
+            assert_eq!(frame.width(), 400);
+            // Parking happens later, in `position_layout_windows`.
+            assert_eq!(frame.min.y, 0);
+        }
+        // All three must be at the identical x too (same column slot).
+        let xs: std::collections::HashSet<_> = out.iter().map(|(_, f)| f.min.x).collect();
+        assert_eq!(xs.len(), 1, "every tab must share the same column x");
+    }
+
+    /// Switching the active tab leaves `relative_positions` unchanged; the
+    /// visual swap happens in `position_layout_windows`.
+    #[test]
+    fn test_tabbed_stack_switching_active_tab_does_not_change_relative_positions() {
         let mut world = World::new();
         let entities = world.spawn_batch(vec![(), (), ()]).collect::<Vec<Entity>>();
 
@@ -2068,23 +2677,88 @@ mod tests {
         strip.stack(entities[1]).unwrap();
         strip.stack(entities[2]).unwrap();
         strip.toggle_tabbed_display(entities[1]);
+        assert!(strip.set_active_tab(entities[2]));
 
         let get_window_frame = |_| Some(IRect::new(0, 0, 400, 300));
         let out: Vec<_> = strip.relative_positions(700, &get_window_frame).collect();
 
-        assert_eq!(out.len(), 3);
-        for (_, frame) in &out {
-            assert_eq!(frame.min.y, 0, "every tab must start at the column's top");
-            assert_eq!(
-                frame.height(),
-                700,
-                "every tab must fill the full column height"
-            );
-            assert_eq!(frame.width(), 400);
+        let frame_of = |entity: Entity| out.iter().find(|(e, _)| *e == entity).unwrap().1;
+        assert_eq!(frame_of(entities[2]).min.y, 0);
+        assert_eq!(frame_of(entities[1]).min.y, 0);
+        assert_eq!(frame_of(entities[0]).min.y, 0);
+    }
+
+    /// Regression: a tabbed column's width must not come from a narrower,
+    /// still-resizing parked leader.
+    #[test]
+    fn test_tabbed_stack_column_width_comes_from_the_widest_member_not_the_leader() {
+        let mut world = World::new();
+        let entities = world.spawn_batch(vec![(), (), ()]).collect::<Vec<Entity>>();
+
+        let mut strip = LayoutStrip::default();
+        for &e in &entities {
+            strip.append(e);
         }
-        // All three must be at the identical x too (same column slot).
-        let xs: std::collections::HashSet<_> = out.iter().map(|(_, f)| f.min.x).collect();
-        assert_eq!(xs.len(), 1, "every tab must share the same column x");
+        strip.stack(entities[1]).unwrap();
+        strip.stack(entities[2]).unwrap();
+        // Leader and active tab must differ for this test to mean anything.
+        strip.toggle_tabbed_display(entities[2]);
+        assert_eq!(strip.active_tab(entities[0]), Some(entities[2]));
+
+        let active = entities[2];
+        let get_window_frame = move |entity: Entity| {
+            if entity == active {
+                Some(IRect::new(0, 0, 900, 300))
+            } else {
+                // Parked members are mid partial off-screen resize.
+                Some(IRect::new(0, 0, 200, 300))
+            }
+        };
+        let out: Vec<_> = strip.relative_positions(700, &get_window_frame).collect();
+
+        for (entity, frame) in &out {
+            assert_eq!(
+                frame.width(),
+                900,
+                "every member (including {entity}) must share the widest member's width, \
+                 not the structural leader's"
+            );
+        }
+    }
+
+    /// Regression: a tabbed column's width comes from its widest member, so
+    /// a narrower active tab doesn't shrink the column on each switch.
+    #[test]
+    fn test_tabbed_stack_column_width_is_stable_across_active_tab_switches() {
+        let mut world = World::new();
+        let entities = world.spawn_batch(vec![(), (), ()]).collect::<Vec<Entity>>();
+
+        let mut strip = LayoutStrip::default();
+        for &e in &entities {
+            strip.append(e);
+        }
+        strip.stack(entities[1]).unwrap();
+        strip.stack(entities[2]).unwrap();
+        strip.toggle_tabbed_display(entities[0]);
+
+        // The active tab reports a narrower, still-settling frame.
+        let get_window_frame = move |entity: Entity| {
+            if entity == entities[0] {
+                Some(IRect::new(0, 0, 400, 300))
+            } else {
+                Some(IRect::new(0, 0, 900, 300))
+            }
+        };
+        let out: Vec<_> = strip.relative_positions(700, &get_window_frame).collect();
+
+        for (entity, frame) in &out {
+            assert_eq!(
+                frame.width(),
+                900,
+                "column width must come from the widest member ({entity}), \
+                 not shrink to match whichever tab is currently active"
+            );
+        }
     }
 
     #[test]
@@ -2473,6 +3147,144 @@ mod tests {
         assert_eq!(strip.tab_group(e1), Some(vec![e2, e1]));
         assert_eq!(strip.tab_group(e2), Some(vec![e2, e1]));
         assert_eq!(strip.tab_group(e3), None);
+    }
+
+    #[test]
+    fn test_relocation_group_prefers_native_tabs_over_tabbed_display() {
+        let mut world = World::new();
+        let e1 = world.spawn_empty().id();
+        let e2 = world.spawn_empty().id();
+        let e3 = world.spawn_empty().id();
+
+        let mut strip = LayoutStrip::default();
+        strip.append(e1);
+        strip.convert_to_tabs(e1, e2).unwrap();
+        strip.append(e3);
+
+        assert_eq!(
+            strip.relocation_group(e1),
+            Some(RelocationGroup::NativeTabs(vec![e2, e1]))
+        );
+        assert_eq!(
+            strip.relocation_group(e2),
+            Some(RelocationGroup::NativeTabs(vec![e2, e1]))
+        );
+        assert_eq!(strip.relocation_group(e3), None);
+
+        // When a native tab item is stacked with e3 and toggled into tabbed
+        // display, relocating any member must move the whole tabbed stack.
+        strip.stack(e3).unwrap();
+        strip.toggle_tabbed_display(e3);
+        assert_eq!(
+            strip.relocation_group(e1),
+            Some(RelocationGroup::TabbedStack {
+                members: vec![e2, e1, e3],
+                active: e3,
+            })
+        );
+    }
+
+    #[test]
+    fn test_relocation_group_returns_the_whole_tabbed_display_stack() {
+        let mut world = World::new();
+        let entities = world.spawn_batch(vec![(), (), ()]).collect::<Vec<Entity>>();
+
+        let mut strip = LayoutStrip::default();
+        for &e in &entities {
+            strip.append(e);
+        }
+        strip.stack(entities[1]).unwrap();
+        strip.stack(entities[2]).unwrap();
+        strip.toggle_tabbed_display(entities[1]);
+
+        for &e in &entities {
+            assert_eq!(
+                strip.relocation_group(e),
+                Some(RelocationGroup::TabbedStack {
+                    members: entities.clone(),
+                    active: entities[1],
+                }),
+                "every member of the tabbed stack should report the same group and active tab"
+            );
+        }
+    }
+
+    #[test]
+    fn test_relocation_group_is_none_for_an_ordinary_stack_or_lone_window() {
+        let mut world = World::new();
+        let entities = world.spawn_batch(vec![(), ()]).collect::<Vec<Entity>>();
+        let lone = world.spawn_empty().id();
+
+        let mut strip = LayoutStrip::default();
+        for &e in &entities {
+            strip.append(e);
+        }
+        strip.stack(entities[1]).unwrap();
+        strip.append(lone);
+
+        // Stacked, but never toggled into tabbed display.
+        assert_eq!(strip.relocation_group(entities[0]), None);
+        assert_eq!(strip.relocation_group(entities[1]), None);
+        // Not grouped by either mechanism at all.
+        assert_eq!(strip.relocation_group(lone), None);
+    }
+
+    #[test]
+    fn test_append_tabbed_stack_recreates_the_group_with_its_active_tab() {
+        let mut world = World::new();
+        let entities = world.spawn_batch(vec![(), (), ()]).collect::<Vec<Entity>>();
+
+        let mut strip = LayoutStrip::default();
+        strip.append_tabbed_stack(&entities, entities[2]);
+
+        match strip.get(0).unwrap() {
+            Column::Stack(items) => {
+                assert_eq!(
+                    items
+                        .iter()
+                        .flat_map(StackItem::window_iter)
+                        .collect::<Vec<_>>(),
+                    entities
+                );
+            }
+            other => panic!("expected a Stack column, got {other:?}"),
+        }
+        assert!(entities.iter().all(|&e| strip.is_tabbed_display(e)));
+        assert_eq!(strip.active_tab(entities[0]), Some(entities[2]));
+    }
+
+    #[test]
+    fn test_insert_tabbed_stack_at_places_group_and_removes_prior_membership() {
+        let mut world = World::new();
+        let entities = world.spawn_batch(vec![(), (), ()]).collect::<Vec<Entity>>();
+        let other = world.spawn_empty().id();
+
+        let mut strip = LayoutStrip::default();
+        // entities[0] is already in the strip and must not be duplicated.
+        strip.append(entities[0]);
+        strip.append(other);
+
+        strip.insert_tabbed_stack_at(0, &entities, entities[1]);
+
+        assert_eq!(
+            strip.len(),
+            2,
+            "the group must not leave a stale column behind"
+        );
+        match strip.get(0).unwrap() {
+            Column::Stack(items) => {
+                assert_eq!(
+                    items
+                        .iter()
+                        .flat_map(StackItem::window_iter)
+                        .collect::<Vec<_>>(),
+                    entities
+                );
+            }
+            other => panic!("expected a Stack column, got {other:?}"),
+        }
+        assert_eq!(strip.active_tab(entities[0]), Some(entities[1]));
+        assert!(matches!(strip.get(1).unwrap(), Column::Single(id) if id == other));
     }
 
     #[test]

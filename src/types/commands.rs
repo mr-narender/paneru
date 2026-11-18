@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub use crate::argv::{ParseError, parse_command};
+pub use crate::types::argv::{ParseError, parse_command};
 
 /// Represents a cardinal or directional choice for window manipulation.
 ///
@@ -234,6 +234,8 @@ pub enum Operation {
     FullWidth,
     /// Moves the focused window to the next available display.
     ToNextDisplay(MoveFocus),
+    /// Moves the focused window to the display with this ID.
+    ToDisplay(u32, MoveFocus),
     /// Distributes heights equally among windows in the focused stack.
     Equalize,
     /// Makes all columns in the active strip the same width as the focused window.
@@ -242,6 +244,17 @@ pub enum Operation {
     Manage,
     /// Stacks or unstacks a window. The boolean indicates whether to stack (`true`) or unstack (`false`).
     Stack(bool),
+    /// Consumes the column to the right of the focused window's column into
+    /// it, appending the consumed column's item(s) below whatever is
+    /// already there. Mirror of `Stack(true)` in the opposite direction —
+    /// the focused window's own column survives at its position; the
+    /// neighbor's does not.
+    Consume,
+    /// Pulls the focused window out of its stack into its own column to
+    /// the right — mechanically identical to `Stack(false)` — but leaves
+    /// focus on a sibling remaining in the stack instead of following the
+    /// ejected window.
+    Expel,
     /// Toggles the focused window's stack between a normal split display
     /// (all windows visible, sharing height) and a tabbed display (one
     /// window visible at a time, sharing the full column). Cycle tabs with
@@ -290,6 +303,8 @@ pub enum Operation {
 pub enum MouseMove {
     /// Moves the mouse pointer to the next available display.
     ToNextDisplay,
+    /// Moves the mouse pointer to the display with this ID.
+    ToDisplay(u32),
 }
 
 /// Represents a command that can be issued to the window manager.
@@ -311,5 +326,7 @@ pub enum Command {
     /// Layout operations a Lua handler produced by transforming a `WindowSet`.
     /// Window-addressed, unlike every other command here, and applied
     /// best-effort: see `ecs::layout_ops`. Never produced by parsing.
-    Layout(Vec<crate::windowset::LayoutOp>),
+    Layout(Vec<crate::types::windowset::LayoutOp>),
+    /// Shows or hides the menu bar item and remembers the choice.
+    MenuBar(bool),
 }

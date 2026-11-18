@@ -1,5 +1,7 @@
 use serde::{Deserialize, Deserializer, de};
 
+use crate::tab_indicator::TabIndicatorPosition;
+
 #[derive(Deserialize, Clone, Debug, Default)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct DecorationsOptions {
@@ -8,6 +10,26 @@ pub struct DecorationsOptions {
     pub workspace_menu_status: Option<bool>,
     pub menu: Option<MenubarOptions>,
     pub workspace_popup_status: Option<bool>,
+    pub tab_indicator: Option<TabIndicatorOptions>,
+}
+
+#[derive(Deserialize, Clone, Debug, Default)]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct TabIndicatorOptions {
+    /// Draw the clickable tab indicator on tabbed columns. Default: true.
+    pub enabled: Option<bool>,
+    /// Column edge the indicator sits against. Default: left.
+    pub position: Option<TabIndicatorPosition>,
+    /// Indicator thickness in pixels. Default: 6.0.
+    pub width: Option<f64>,
+    /// Gap between indicator and column, in pixels. Default: 4.0.
+    pub gap: Option<f64>,
+    /// Gap between tab segments, in pixels. Default: 2.0.
+    pub segment_gap: Option<f64>,
+    /// Hex color of the active tab's segment. Default: "#5AC8FA".
+    pub active_color: Option<String>,
+    /// Hex color of inactive segments. Default: "#666666".
+    pub inactive_color: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Debug, Default)]
@@ -26,6 +48,9 @@ pub struct GeneralBorderOptions {
     /// Hex color for the window border, e.g. "#FF0000".
     /// Default: "#FFFFFF" (white).
     pub color: Option<String>,
+    /// Hex color for the window border when in Dark Mode.
+    /// Default: `color`.
+    pub color_night: Option<String>,
     /// Opacity of the window border (0.0–1.0).
     /// Default: 1.0.
     pub opacity: Option<f64>,
@@ -54,6 +79,8 @@ pub struct GeneralDimOptions {
 #[derive(Deserialize, Debug, Clone, Default)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct MenubarOptions {
+    /// Show the Paneru menu bar item. Default: true.
+    pub enabled: Option<bool>,
     pub orientation: Option<MenubarOrientation>,
     pub colors: Option<Vec<String>>,
     pub angle: Option<f64>,

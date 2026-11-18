@@ -14,6 +14,7 @@ use crate::ecs::focus::FocusEventsPlugin;
 use crate::ecs::layout::LayoutEventsPlugin;
 use crate::ecs::mouse::MouseEventsPlugin;
 use crate::ecs::scroll::ScrollEventsPlugin;
+use crate::ecs::setups::DisplaySetupsPlugin;
 use crate::ecs::state::PaneruState;
 use crate::ecs::workspace::WorkspaceEventsPlugin;
 use crate::ecs::{
@@ -209,6 +210,17 @@ impl TestHarness {
     }
 
     pub(crate) fn run(&mut self, commands: Vec<Event>) {
+        let unreached: Vec<usize> = self
+            .verifiers
+            .keys()
+            .copied()
+            .filter(|iteration| *iteration >= commands.len())
+            .collect();
+        assert!(
+            unreached.is_empty(),
+            "verifiers for iterations {unreached:?} never run: only {} commands",
+            commands.len()
+        );
         for (iteration, command) in commands.into_iter().enumerate() {
             self.app.world_mut().write_message::<Event>(command);
 
@@ -267,6 +279,7 @@ fn setup_world() -> App {
         .add_plugins(LayoutEventsPlugin)
         .add_plugins(FocusEventsPlugin)
         .add_plugins(DisplayEventsPlugin)
+        .add_plugins(DisplaySetupsPlugin)
         .add_plugins((register_triggers, register_systems, register_commands));
 
     bevy_app.insert_resource(TimeUpdateStrategy::ManualDuration(FRAME));

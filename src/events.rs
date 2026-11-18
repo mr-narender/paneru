@@ -1,8 +1,8 @@
+use crate::types::wire::{Response, ScriptStateRequest};
 use bevy::ecs::message::Message;
 use objc2::rc::Retained;
 use objc2_core_foundation::{CFRetained, CGPoint};
 use objc2_core_graphics::CGDirectDisplayID;
-use paneru_shared_types::wire::{Response, ScriptStateRequest};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
@@ -90,7 +90,11 @@ pub enum Event {
         app_name: String,
         bundle_id: String,
         title: String,
-        frame: paneru_shared_types::state::Frame,
+        /// Accessibility role (e.g. `AXWindow`), when the window reports one.
+        role: Option<String>,
+        /// Accessibility subrole (e.g. `AXDialog`), when the window reports one.
+        subrole: Option<String>,
+        frame: crate::types::state::Frame,
         floating: bool,
         managed: bool,
     },
@@ -135,7 +139,15 @@ pub enum Event {
     },
 
     /// A swipe gesture has been detected.
-    Swipe { delta: f64, fingers: usize },
+    Swipe {
+        delta: f64,
+        fingers: usize,
+        /// Signed mean horizontal finger travel in centimeters.
+        distance_cm: f64,
+        /// Elapsed source-event time since the finger positions used as the
+        /// displacement anchor. `None` is for synthetic events without a clock.
+        elapsed_secs: Option<f64>,
+    },
 
     /// A vertical trackpad gesture (accumulates delta to threshold before firing).
     VerticalSwipe { delta: f64, fingers: usize },
@@ -200,6 +212,10 @@ pub enum Event {
     /// A command has been issued to the window manager.
     Command { command: Command },
 
+    /// A tab-indicator segment was clicked. Raw `AppKit` signal, not a
+    /// `Command`, like `MenuOpened`/`MenuClosed`.
+    TabIndicatorClicked { window_id: WinID },
+
     /// A structured state query has been issued by a client.
     StateQuery {
         kind: StateQueryKind,
@@ -213,7 +229,7 @@ pub enum Event {
     /// A client has subscribed to state events. Carries the channel they are
     /// pushed to, which outlives the request that delivered it.
     StateSubscribe {
-        subscriber: Arc<paneru_shared_types::wire::Subscriber>,
+        subscriber: Arc<crate::types::wire::Subscriber>,
     },
 
     /// A client has read or written the script state store. Answered
