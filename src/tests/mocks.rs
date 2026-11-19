@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use bevy::prelude::*;
 use objc2_core_foundation::CGPoint;
@@ -11,7 +11,7 @@ use crate::events::{DestroySource, Event};
 use crate::manager::app::MockApplicationApi;
 use crate::manager::{
     Application, Display, MockProcessApi, MockWindowApi, MockWindowManagerApi, Origin, Size,
-    Window, origin_from, origin_to,
+    Window, WindowPadding, origin_from, origin_to,
 };
 use crate::platform::{Modifiers, Pid, ProcessSerialNumber, WinID, WorkspaceId};
 
@@ -44,7 +44,18 @@ pub(crate) struct MockWindowData {
     pub(crate) border_radius: Option<f64>,
     pub(crate) horizontal_padding: i32,
     pub(crate) vertical_padding: i32,
+    /// The last horizontal and vertical padding the engine set, which the
+    /// mock does not apply to its frames.
+    pub(crate) padding_set: (Option<i32>, Option<i32>),
     pub(crate) child_role: bool,
+    /// The narrowest width the app accepts, like an `NSWindow.minSize`.
+    pub(crate) min_width: i32,
+    /// The widest width the app accepts, or no limit when zero.
+    pub(crate) max_width: i32,
+    /// When true, `resize()` clamps the window's bottom edge to the active
+    /// display's bottom edge and rejects height growth while parked off-screen,
+    /// modelling macOS WindowServer/AppKit frame constraints.
+    pub(crate) clamp_height_to_display: bool,
 }
 
 impl Default for MockWindowData {
@@ -64,7 +75,11 @@ impl Default for MockWindowData {
             border_radius: None,
             horizontal_padding: 0,
             vertical_padding: 0,
+            padding_set: (None, None),
             child_role: false,
+            min_width: 0,
+            max_width: 0,
+            clamp_height_to_display: false,
         }
     }
 }
@@ -92,6 +107,12 @@ struct MockStateInner {
     /// Windows the app keeps out of its accessibility window list while the
     /// window server still reports them on screen: a background native tab.
     background_tabs: HashSet<WinID>,
+    /// Windows raised without focus, in order, so a test can check what ends
+    /// up in front of what.
+    raised: Vec<WinID>,
+    /// How many times each app has been asked for its focused window or its
+    /// window list, so a test can check who a lookup bothers.
+    app_reads: HashMap<Pid, usize>,
 }
 
 #[derive(Clone)]
@@ -113,8 +134,15 @@ impl MockState {
                 stale_window_ids: HashMap::new(),
                 unordered_windows: HashSet::new(),
                 background_tabs: HashSet::new(),
+                raised: Vec::new(),
+                app_reads: HashMap::new(),
             })),
         }
+    }
+
+    /// The windows raised since this was last called, in the order they were.
+    pub fn take_raised(&self) -> Vec<WinID> {
+        std::mem::take(&mut self.inner.force_write().raised)
     }
 
     #[allow(dead_code)]
@@ -125,6 +153,12 @@ impl MockState {
         } else {
             inner.unordered_windows.remove(&window_id);
         }
+    }
+
+    /// How many times `pid` has been asked for its focused window or window
+    /// list since this was last called.
+    pub fn take_app_reads(&self, pid: Pid) -> usize {
+        self.inner.force_write().app_reads.remove(&pid).unwrap_or(0)
     }
 
     /// Makes `window_id` a background native tab: on screen as far as the
@@ -232,6 +266,11 @@ impl MockState {
         );
     }
 
+    pub fn set_display_bounds(&self, id: u32, bounds: IRect) {
+        let mut inner = self.inner.force_write();
+        inner.displays.get_mut(&id).expect("finding display").bounds = bounds;
+    }
+
     #[allow(unused)]
     pub fn remove_display(&self, id: u32) {
         let mut inner = self.inner.force_write();
@@ -243,6 +282,13 @@ impl MockState {
 
     pub fn active_display(&self) -> CGDirectDisplayID {
         self.inner.force_read().active_display_id
+    }
+
+    pub(crate) fn activate_display(&self, id: CGDirectDisplayID) {
+        let mut inner = self.inner.force_write();
+        assert!(inner.displays.contains_key(&id), "finding display");
+        inner.active_display_id = id;
+        inner.event_queue.push_back(Event::DisplayChanged);
     }
 
     pub(crate) fn activate_workspace(
@@ -452,8 +498,31 @@ impl MockState {
         let s = self.clone();
         mw.expect_resize().returning(move |size| {
             let mut inner = s.inner.force_write();
+            let display_bounds = inner
+                .displays
+                .get(&inner.active_display_id)
+                .map(|d| d.bounds);
             if let Some(w) = inner.windows.get_mut(&id) {
-                w.frame.max = w.frame.min + size;
+                let max_width = if w.max_width > 0 {
+                    w.max_width
+                } else {
+                    i32::MAX
+                };
+                let width = size.x.max(w.min_width).min(max_width);
+                let height = if w.clamp_height_to_display
+                    && let Some(bounds) = display_bounds
+                {
+                    let on_screen_horizontally =
+                        w.frame.max.x > bounds.min.x + 20 && w.frame.min.x < bounds.max.x - 20;
+                    if !on_screen_horizontally && size.y > w.frame.height() {
+                        w.frame.height()
+                    } else {
+                        size.y.min((bounds.max.y - w.frame.min.y).max(1))
+                    }
+                } else {
+                    size.y
+                };
+                w.frame.max = w.frame.min + Size::new(width, height);
             }
         });
 
@@ -515,23 +584,52 @@ impl MockState {
         });
 
         let s = self.clone();
+        // Cached after the first successful read, like `WindowOS::role`, so a
+        // closed window keeps reporting its role here too.
+        let cached_role = Arc::new(OnceLock::<String>::new());
         mw.expect_role().returning(move || {
-            s.inner
+            if let Some(role) = cached_role.get() {
+                return Ok(role.clone());
+            }
+            let role = s
+                .inner
                 .force_read()
                 .windows
                 .get(&id)
                 .map(|w| w.role.clone())
-                .ok_or_else(|| crate::errors::Error::Generic(format!("window {id} not found")))
+                .ok_or_else(|| crate::errors::Error::Generic(format!("window {id} not found")))?;
+            if role != accessibility_sys::kAXUnknownRole {
+                let _ = cached_role.set(role.clone());
+            }
+            Ok(role)
         });
 
         let s = self.clone();
+        mw.expect_is_alive()
+            .returning(move || s.inner.force_read().windows.contains_key(&id));
+
+        let s = self.clone();
+        // An empty subrole models a window without an `AXSubrole` attribute,
+        // which AX reports as an error rather than an empty string.
+        let cached_subrole = Arc::new(OnceLock::<String>::new());
         mw.expect_subrole().returning(move || {
-            Ok(s.inner
+            if let Some(subrole) = cached_subrole.get() {
+                return Ok(subrole.clone());
+            }
+            let subrole = s
+                .inner
                 .force_read()
                 .windows
                 .get(&id)
                 .map(|w| w.subrole.clone())
-                .unwrap_or_default())
+                .filter(|subrole| !subrole.is_empty())
+                .ok_or_else(|| {
+                    crate::errors::Error::Generic(format!("window {id} has no subrole"))
+                })?;
+            if subrole != accessibility_sys::kAXUnknownSubrole {
+                let _ = cached_subrole.set(subrole.clone());
+            }
+            Ok(subrole)
         });
 
         let s = self.clone();
@@ -583,7 +681,9 @@ impl MockState {
 
         // Fill in remaining defaults
         mw.expect_element().return_const(None);
-        mw.expect_raise_without_focus().return_const(());
+        let s = self.clone();
+        mw.expect_raise_without_focus()
+            .returning(move || s.inner.force_write().raised.push(id));
 
         // Focusing without raising still moves the OS focus, it just leaves the
         // window order alone. Only the app's idea of its focused window changes
@@ -597,12 +697,28 @@ impl MockState {
             .returning(move |_psn, _focused, _focused_psn| {
                 s.set_focused_window(id);
             });
-        mw.expect_set_padding().return_const(());
+        let s = self.clone();
+        mw.expect_set_padding().returning(move |padding| {
+            if let Some(window) = s.inner.force_write().windows.get_mut(&id) {
+                match padding {
+                    WindowPadding::Horizontal(padding) => window.padding_set.0 = Some(padding),
+                    WindowPadding::Vertical(padding) => window.padding_set.1 = Some(padding),
+                }
+            }
+        });
 
         Window::new(Box::new(mw))
     }
 
     pub fn create_application(&self, pid: Pid) -> Application {
+        self.create_application_with_observer(pid, || Ok(true))
+    }
+
+    pub fn create_application_with_observer(
+        &self,
+        pid: Pid,
+        observe: impl FnMut() -> crate::errors::Result<bool> + Send + 'static,
+    ) -> Application {
         let mut ma = MockApplicationApi::new();
         let s = self.clone();
 
@@ -622,6 +738,7 @@ impl MockState {
 
         let s = self.clone();
         ma.expect_focused_window().returning(move |_config| {
+            *s.inner.force_write().app_reads.entry(pid).or_default() += 1;
             let inner = s.inner.force_read();
             let focused_id = inner.apps.get(&pid).and_then(|a| a.focused_window_id)?;
             if inner.windows.contains_key(&focused_id) {
@@ -667,7 +784,7 @@ impl MockState {
                 .and_then(|a| a.connection)
         });
 
-        ma.expect_observe().returning(|| Ok(true));
+        ma.expect_observe().returning(observe);
         ma.expect_observe_window().returning(|_| Ok(true));
         ma.expect_unobserve_window().return_const(());
         let s = self.clone();
@@ -689,8 +806,10 @@ impl MockState {
         };
 
         let (s, ids) = (self.clone(), window_ids.clone());
-        ma.expect_window_list()
-            .returning(move |_| ids().into_iter().map(|id| s.create_window(id)).collect());
+        ma.expect_window_list().returning(move |_| {
+            *s.inner.force_write().app_reads.entry(pid).or_default() += 1;
+            ids().into_iter().map(|id| s.create_window(id)).collect()
+        });
 
         let (s, ids) = (self.clone(), window_ids.clone());
         ma.expect_ax_window_ids().returning(move || {
@@ -707,6 +826,8 @@ impl MockState {
     #[allow(clippy::too_many_lines)]
     pub fn create_window_manager(&self) -> MockWindowManagerApi {
         let mut wm = MockWindowManagerApi::new();
+
+        wm.expect_dim_windows().returning(|_, _| ());
 
         let s = self.clone();
         wm.expect_window_is_unordered().returning(move |window_id| {
@@ -740,6 +861,8 @@ impl MockState {
             });
 
         let s = self.clone();
+        wm.expect_display_uuid()
+            .returning(|display_id| Some(format!("display-{display_id}")));
         wm.expect_present_displays().returning(move || {
             s.inner
                 .force_read()
@@ -801,6 +924,16 @@ impl MockState {
         });
 
         let s = self.clone();
+        wm.expect_window_owner().returning(move |window_id| {
+            let inner = s.inner.force_read();
+            inner
+                .windows
+                .get(&window_id)
+                .map(|w| w.pid)
+                .or_else(|| inner.stale_window_ids.get(&window_id).copied())
+        });
+
+        let s = self.clone();
         wm.expect_warp_mouse()
             .returning(move |origin| s.inner.force_write().cursor_position = origin);
 
@@ -809,6 +942,7 @@ impl MockState {
             .returning(move || Some(origin_to(s.inner.force_read().cursor_position)));
 
         wm.expect_get_associated_windows().return_const(vec![]);
+        wm.expect_dim_windows().return_const(());
 
         let s = self.clone();
         wm.expect_find_window_at_point().returning(move |at_point| {

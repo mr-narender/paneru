@@ -4,7 +4,6 @@ use bevy::{
         hierarchy::ChildOf,
         query::{With, Without},
         system::{Commands, Query, Res, ResMut, Single, SystemParam},
-        world::Mut,
     },
     math::IRect,
 };
@@ -155,7 +154,7 @@ impl ActiveDisplay<'_, '_> {
 /// It allows systems to modify the active display and its associated `LayoutStrip`s.
 #[derive(SystemParam)]
 pub struct ActiveDisplayMut<'w, 's> {
-    strip: Single<'w, 's, &'static mut LayoutStrip, With<ActiveWorkspaceMarker>>,
+    strip: Single<'w, 's, (&'static mut LayoutStrip, Entity), With<ActiveWorkspaceMarker>>,
     /// The single active `Display` component, marked with `ActiveDisplayMarker`.
     display: Single<
         'w,
@@ -164,7 +163,7 @@ pub struct ActiveDisplayMut<'w, 's> {
         With<ActiveDisplayMarker>,
     >,
     /// A query for all other `Display` components that are not marked as active.
-    other_displays: Query<'w, 's, &'static mut Display, Without<ActiveDisplayMarker>>,
+    other_displays: Query<'w, 's, &'static Display, Without<ActiveDisplayMarker>>,
 }
 
 impl ActiveDisplayMut<'_, '_> {
@@ -176,13 +175,21 @@ impl ActiveDisplayMut<'_, '_> {
         self.display.2
     }
 
-    /// Returns an iterator over mutable references to all other displays (non-active).
-    pub fn other(&mut self) -> impl Iterator<Item = Mut<'_, Display>> {
-        self.other_displays.iter_mut()
+    /// Returns an iterator over immutable references to all other displays (non-active).
+    pub fn other(&self) -> impl Iterator<Item = &Display> {
+        self.other_displays.iter()
+    }
+
+    pub fn strip(&self) -> &LayoutStrip {
+        &self.strip.0
     }
 
     pub fn active_strip(&mut self) -> &mut LayoutStrip {
-        &mut self.strip
+        &mut self.strip.0
+    }
+
+    pub fn active_strip_entity(&self) -> Entity {
+        self.strip.1
     }
 
     /// Returns the `CGRect` representing the bounds of the active display.
@@ -350,6 +357,12 @@ impl Windows<'_, '_> {
             .get(entity)
             .ok()
             .map(|(_, _, size, _, _, _)| size.0)
+    }
+
+    pub fn is_resizing(&self, entity: Entity) -> bool {
+        self.positions
+            .get(entity)
+            .is_ok_and(|(_, _, _, _, _, resize)| resize.is_some())
     }
 
     pub fn width_ratio(&self, entity: Entity) -> Option<f64> {

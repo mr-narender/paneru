@@ -8,16 +8,96 @@ use crate::commands::{Command, Direction, MoveFocus, Operation};
 use crate::config::{Config, MainOptions, WindowParams, parse_command};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::{
-    ActiveWorkspaceMarker, FocusedMarker, ManualStripOffset, NativeFullscreenMarker, Position,
-    Unmanaged, layout::LayoutStrip,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, FocusedMarker, ManualStripOffset,
+    NativeFullscreenMarker, Position, Unmanaged, layout::LayoutStrip,
 };
 use crate::ecs::{RepositionMarker, SpawnWindowTrigger};
 use crate::events::Event;
 use crate::manager::{Origin, Size, Window};
-use crate::platform::{Modifiers, WinID};
+use crate::platform::{Modifiers, Pid, WinID};
 use crate::{assert_focused, assert_window_at, assert_window_size};
 
 use super::*;
+
+// Exercise late AX readiness through the production lifecycle.
+#[test]
+fn delayed_application_keeps_observer_and_discovers_late_window() {
+    use crate::ecs::{BProcess, FreshMarker, Timeout};
+    use crate::manager::Application;
+
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.advance(Duration::from_secs(1));
+    let pid = 42;
+    harness.mock_state.spawn_app(pid, "org.gnu.Emacs", "Emacs");
+    let mut wm = harness.mock_state.create_window_manager();
+    let state = harness.mock_state.clone();
+    wm.expect_new_application()
+        .returning(move |process| Ok(state.create_application(process.pid())));
+    harness
+        .world()
+        .insert_resource(crate::manager::WindowManager(Box::new(wm)));
+    let process = harness.mock_state.create_process(pid);
+    harness
+        .world()
+        .spawn((BProcess(Box::new(process)), FreshMarker));
+    harness.advance(Duration::from_secs(12));
+    let world = harness.world();
+    let app_entity = world
+        .query::<(Entity, &Application)>()
+        .iter(world)
+        .find(|(_, app)| app.pid() == pid)
+        .map(|(entity, _)| entity)
+        .expect("timeout must retain application and AX observer");
+    assert!(world.get::<FreshMarker>(app_entity).is_none());
+    assert!(world.get::<Timeout>(app_entity).is_none());
+    assert!(
+        world
+            .get::<crate::ecs::systems::PendingWindowRecovery>(app_entity)
+            .is_some()
+    );
+
+    // No second creation/focus event: AX becomes usable after polling expires.
+    harness.mock_state.spawn_window(
+        pid,
+        TEST_WORKSPACE_ID,
+        42,
+        IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT),
+    );
+    harness.advance(Duration::from_secs(2));
+    find_window_entity(42, harness.world());
+    harness.advance(Duration::from_secs(2));
+    let world = harness.world();
+    assert!(
+        world
+            .get::<crate::ecs::systems::PendingWindowRecovery>(app_entity)
+            .is_none(),
+        "window discovery must clear post-launch recovery polling"
+    );
+    assert_eq!(
+        world
+            .query::<&Window>()
+            .iter(world)
+            .filter(|w| w.id() == 42)
+            .count(),
+        1
+    );
+}
+
+#[derive(Resource, Default)]
+struct PagingHapticCount(usize);
+
+fn count_paging_haptics(
+    mut requests: MessageReader<crate::ecs::focus::PageHapticRequest>,
+    mut count: ResMut<PagingHapticCount>,
+) {
+    count.0 += requests.read().count();
+}
+
+fn with_paging_haptic_counter(mut harness: TestHarness) -> TestHarness {
+    harness.app.init_resource::<PagingHapticCount>();
+    harness.app.add_systems(PostUpdate, count_paging_haptics);
+    harness
+}
 
 #[test]
 fn native_fullscreen_transition_removes_window_from_original_strip_without_focus_marker() {
@@ -320,116 +400,933 @@ fn test_scrolling() {
         Event::Command {
             command: Command::PrintState,
         },
-        // A single event's delta is a fraction of the viewport travelled in
-        // one frame, and the gesture velocity it produces is `delta / dt`.
-        // 0.04 over a 20ms frame is two viewport widths per second — a brisk
-        // but ordinary swipe, which is the regime this test is about. An order
-        // of magnitude more and the strip simply flies into its clamp bound
-        // and every window parks off-screen at the sliver, which asserts
-        // nothing about scrolling.
-        Event::Swipe {
-            delta: 0.04,
-            fingers: 3,
-        },
-        Event::Command {
-            command: Command::PrintState,
-        },
     ];
 
     let config: Config = (
         MainOptions {
             swipe_gesture_fingers: Some(3),
+            auto_center: Some(false),
             ..Default::default()
         },
         vec![],
     )
         .into();
 
-    TestHarness::new()
-        .with_config(config)
-        .with_windows(3)
-        .on_iteration(3, move |world, _state| {
-            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 1, 400, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 2, 800, TEST_MENUBAR_HEIGHT);
-        })
-        // The strip has come to rest mid-scroll: still one contiguous run of
-        // 400px columns, none of them parked at an edge sliver.
-        .on_iteration(5, move |world, _state| {
-            assert_window_at!(world, 0, -186, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 1, 214, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 2, 614, TEST_MENUBAR_HEIGHT);
-        })
-        .run(commands);
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.run(commands);
+    let world = harness.world();
+    assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+    assert_window_at!(world, 1, 400, TEST_MENUBAR_HEIGHT);
+    assert_window_at!(world, 2, 800, TEST_MENUBAR_HEIGHT);
+
+    // Send lift with the swipe; `run` gives each listed event a 500ms window.
+    world.write_message::<Event>(Event::Swipe {
+        delta: 0.04,
+        fingers: 3,
+        distance_cm: 0.0,
+        elapsed_secs: Some(0.02),
+    });
+    world.write_message::<Event>(Event::TouchpadUp);
+    harness.advance(Duration::from_millis(80));
+
+    let world = harness.world();
+    let first_x = world
+        .query::<&Window>()
+        .iter(world)
+        .find(|window| window.id() == 0)
+        .expect("first window")
+        .frame()
+        .min
+        .x;
+    assert!((-300..-50).contains(&first_x));
+    assert_window_at!(world, 1, first_x + 400, TEST_MENUBAR_HEIGHT);
+    assert_window_at!(world, 2, first_x + 800, TEST_MENUBAR_HEIGHT);
 }
 
 #[test]
-#[allow(clippy::float_cmp)]
-fn test_scrolling_stop() {
-    let commands = vec![
-        Event::MenuOpened { window_id: 0 },
-        Event::Swipe {
-            delta: 0.3,
-            fingers: 3,
+fn swipe_frame_moves_only_by_finger_displacement() {
+    let config: Config = (
+        MainOptions {
+            swipe_gesture_fingers: Some(3),
+            auto_center: Some(false),
+            ..Default::default()
         },
-        Event::TouchpadDown,
-    ];
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.advance(Duration::from_millis(40));
+
+    let initial_x = {
+        let world = harness.world();
+        world
+            .query_filtered::<&Position, With<ActiveWorkspaceMarker>>()
+            .single(world)
+            .expect("active workspace")
+            .0
+            .x
+    };
+    let world = harness.world();
+    world.write_message::<Event>(Event::TouchpadDown);
+    world.write_message::<Event>(Event::Swipe {
+        delta: 0.04,
+        fingers: 3,
+        distance_cm: 0.0,
+        elapsed_secs: None,
+    });
+    harness.advance(Duration::from_millis(20));
+
+    let world = harness.world();
+    let scroll = world
+        .query_filtered::<&crate::ecs::Scrolling, With<ActiveWorkspaceMarker>>()
+        .single(world)
+        .expect("active strip is scrolling");
+    assert!(scroll.is_user_swiping);
+    // The raw touchpad calibration makes 0.04 of a 1024px viewport at the
+    // default 0.35 sensitivity about 72px of direct finger movement.
+    assert!(
+        (scroll.position - f64::from(initial_x) + 72.0).abs() < 0.1,
+        "expected about -72px from the finger, got {}px",
+        scroll.position - f64::from(initial_x)
+    );
+}
+
+#[test]
+fn maximum_swipe_deceleration_halves_velocity_in_40ms() {
+    let config: Config = (
+        MainOptions {
+            swipe_gesture_fingers: Some(3),
+            swipe_deceleration: Some(10.0),
+            auto_center: Some(false),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.advance(Duration::from_millis(40));
+    harness.world().write_message::<Event>(Event::Swipe {
+        delta: 0.04,
+        fingers: 3,
+        distance_cm: 0.0,
+        elapsed_secs: Some(0.016),
+    });
+    harness.advance(Duration::from_millis(20));
+    let before = {
+        let world = harness.world();
+        world
+            .query_filtered::<&crate::ecs::Scrolling, With<ActiveWorkspaceMarker>>()
+            .single(world)
+            .expect("active swipe")
+            .velocity
+    };
+    harness.world().write_message::<Event>(Event::TouchpadUp);
+    harness.advance(Duration::from_millis(40));
+    let world = harness.world();
+    let after = world
+        .query_filtered::<&crate::ecs::Scrolling, With<ActiveWorkspaceMarker>>()
+        .single(world)
+        .expect("coast still active")
+        .velocity;
+    assert!(
+        after / before < 0.5,
+        "velocity retained {}%",
+        after / before * 100.0
+    );
+}
+
+#[test]
+fn swipe_release_velocity_uses_touch_sample_time() {
+    let config: Config = (
+        MainOptions {
+            swipe_gesture_fingers: Some(3),
+            auto_center: Some(false),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.advance(Duration::from_millis(40));
+    harness.world().write_message::<Event>(Event::Swipe {
+        delta: 0.012,
+        fingers: 3,
+        distance_cm: 0.0,
+        elapsed_secs: Some(0.008),
+    });
+    // A busy frame can process an 8ms touch sample in 1ms. The coast must
+    // preserve the finger's measured speed, not multiply it by eight.
+    harness.advance(Duration::from_millis(1));
+
+    let world = harness.world();
+    let scroll = world
+        .query_filtered::<&crate::ecs::Scrolling, With<ActiveWorkspaceMarker>>()
+        .single(world)
+        .expect("active strip is scrolling");
+    assert!(
+        (scroll.velocity - 2.625).abs() < 0.0001,
+        "{}",
+        scroll.velocity
+    );
+}
+
+#[test]
+fn near_simultaneous_touch_phase_does_not_create_coast_spike() {
+    let config: Config = (
+        MainOptions {
+            swipe_gesture_fingers: Some(3),
+            auto_center: Some(false),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.advance(Duration::from_millis(40));
+    harness.world().write_message::<Event>(Event::Swipe {
+        delta: 0.012,
+        fingers: 3,
+        distance_cm: 0.0,
+        elapsed_secs: Some(0.008),
+    });
+    harness.advance(Duration::from_millis(20));
+    let velocity_before = {
+        let world = harness.world();
+        world
+            .query_filtered::<&crate::ecs::Scrolling, With<ActiveWorkspaceMarker>>()
+            .single(world)
+            .expect("active swipe")
+            .velocity
+    };
+
+    // A phase boundary can report a new finger position only 30µs
+    // after its anchor. That displacement still moves the strip by hand,
+    // but it cannot represent a sustained release speed.
+    harness.world().write_message::<Event>(Event::Swipe {
+        delta: 0.009,
+        fingers: 3,
+        distance_cm: 0.0,
+        elapsed_secs: Some(0.00003),
+    });
+    harness.advance(Duration::from_millis(20));
+    let world = harness.world();
+    let velocity_after = world
+        .query_filtered::<&crate::ecs::Scrolling, With<ActiveWorkspaceMarker>>()
+        .single(world)
+        .expect("active swipe")
+        .velocity;
+    assert!((velocity_after - velocity_before).abs() < 0.0001);
+}
+
+#[test]
+fn batched_touch_phase_does_not_inflate_coast_speed() {
+    let config: Config = (
+        MainOptions {
+            swipe_gesture_fingers: Some(3),
+            auto_center: Some(false),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.advance(Duration::from_millis(40));
+    for (delta, elapsed_secs) in [(0.012, 0.008), (0.009, 0.00003)] {
+        harness.world().write_message::<Event>(Event::Swipe {
+            delta,
+            fingers: 3,
+            distance_cm: 0.0,
+            elapsed_secs: Some(elapsed_secs),
+        });
+    }
+    harness.advance(Duration::from_millis(20));
+    let world = harness.world();
+    let scroll = world
+        .query_filtered::<&crate::ecs::Scrolling, With<ActiveWorkspaceMarker>>()
+        .single(world)
+        .expect("active swipe");
+    assert!(
+        (scroll.velocity - 2.625).abs() < 0.0001,
+        "{}",
+        scroll.velocity
+    );
+}
+
+#[test]
+fn finger_lift_starts_coasting_on_the_next_frame() {
+    let config: Config = (
+        MainOptions {
+            swipe_gesture_fingers: Some(3),
+            swipe_deceleration: Some(1.0),
+            auto_center: Some(false),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.advance(Duration::from_millis(40));
+    harness.world().write_message::<Event>(Event::Swipe {
+        delta: 0.04,
+        fingers: 3,
+        distance_cm: 0.0,
+        elapsed_secs: Some(0.016),
+    });
+    harness.advance(Duration::from_millis(20));
+    let finger_position = {
+        let world = harness.world();
+        world
+            .query_filtered::<&crate::ecs::Scrolling, With<ActiveWorkspaceMarker>>()
+            .single(world)
+            .expect("active swipe")
+            .position
+    };
+
+    harness.world().write_message::<Event>(Event::TouchpadUp);
+    harness.advance(Duration::from_millis(20));
+    let world = harness.world();
+    let scroll = world
+        .query_filtered::<&crate::ecs::Scrolling, With<ActiveWorkspaceMarker>>()
+        .single(world)
+        .expect("coast still active");
+    assert!(!scroll.is_user_swiping);
+    assert!(
+        scroll.position < finger_position,
+        "coast should move immediately"
+    );
+}
+
+#[test]
+fn resting_fingers_do_not_start_inertia() {
+    let config: Config = (
+        MainOptions {
+            swipe_gesture_fingers: Some(3),
+            auto_center: Some(false),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.advance(Duration::from_millis(40));
+    harness.world().write_message::<Event>(Event::Swipe {
+        delta: 0.04,
+        fingers: 3,
+        distance_cm: 0.0,
+        elapsed_secs: Some(0.016),
+    });
+    harness.advance(Duration::from_millis(20));
+    let finger_position = {
+        let world = harness.world();
+        world
+            .query_filtered::<&Position, With<ActiveWorkspaceMarker>>()
+            .single(world)
+            .expect("active strip")
+            .0
+            .x
+    };
+
+    // The touch is still down; no Up event has arrived even after the old
+    // 50ms fallback. Paneru may discard the stale velocity, but cannot coast.
+    harness.advance(Duration::from_millis(120));
+    let world = harness.world();
+    let position = world
+        .query_filtered::<&Position, With<ActiveWorkspaceMarker>>()
+        .single(world)
+        .expect("active strip")
+        .0
+        .x;
+    assert_eq!(position, finger_position);
+    assert!(
+        world
+            .query_filtered::<&crate::ecs::Scrolling, With<ActiveWorkspaceMarker>>()
+            .iter(world)
+            .next()
+            .is_none(),
+        "stale touch state should be discarded"
+    );
+}
+
+#[test]
+fn short_frame_does_not_stop_a_visible_coast() {
+    use bevy::time::TimeUpdateStrategy;
 
     let config: Config = (
         MainOptions {
             swipe_gesture_fingers: Some(3),
+            swipe_deceleration: Some(1.0),
+            auto_center: Some(false),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.advance(Duration::from_millis(40));
+    harness.world().write_message::<Event>(Event::Swipe {
+        delta: 0.04,
+        fingers: 3,
+        distance_cm: 0.0,
+        elapsed_secs: Some(0.016),
+    });
+    harness.advance(Duration::from_millis(20));
+    harness.world().write_message::<Event>(Event::TouchpadUp);
+    harness.advance(Duration::from_millis(20));
+
+    harness
+        .world()
+        .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(1)));
+    // 60 one-millisecond frames pass the old 50ms timeout. Each frame moves
+    // under 5px, though the remaining coast is hundreds of pixels.
+    harness.advance(Duration::from_millis(1200));
+    let world = harness.world();
+    let scroll = world
+        .query_filtered::<&crate::ecs::Scrolling, With<ActiveWorkspaceMarker>>()
+        .single(world)
+        .expect("visible coast must survive short frames");
+    assert!(!scroll.is_user_swiping);
+    assert!(scroll.velocity > 0.1);
+}
+
+#[test]
+fn another_finger_landing_during_swipe_preserves_coast_velocity() {
+    let config: Config = (
+        MainOptions {
+            swipe_gesture_fingers: Some(3),
+            auto_center: Some(false),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.advance(Duration::from_millis(40));
+    harness.world().write_message::<Event>(Event::Swipe {
+        delta: 0.04,
+        fingers: 3,
+        distance_cm: 0.0,
+        elapsed_secs: None,
+    });
+    harness.advance(Duration::from_millis(20));
+    let velocity_before = {
+        let world = harness.world();
+        world
+            .query_filtered::<&crate::ecs::Scrolling, With<ActiveWorkspaceMarker>>()
+            .single(world)
+            .expect("swipe velocity")
+            .velocity
+    };
+    assert!(velocity_before > 0.0);
+
+    harness.world().write_message::<Event>(Event::TouchpadDown);
+    harness.advance(Duration::from_millis(20));
+    let world = harness.world();
+    let scroll = world
+        .query_filtered::<&crate::ecs::Scrolling, With<ActiveWorkspaceMarker>>()
+        .single(world)
+        .expect("active swipe");
+    assert!(scroll.is_user_swiping);
+    assert_eq!(scroll.velocity, velocity_before);
+}
+
+#[test]
+fn paging_waits_for_distance_then_focuses_without_free_scrolling() {
+    let config = Config::try_from(
+        "[swipe.gesture]\nfingers_count = 3\npaging = true\npage_distance_cm = 2.0\n",
+    )
+    .unwrap();
+    let mut h = TestHarness::new().with_config(config).with_windows(4);
+    h.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: 0.1,
+        fingers: 3,
+        distance_cm: 1.5,
+        elapsed_secs: None,
+    });
+    h.advance(Duration::from_millis(40));
+    let world = h.world();
+    assert_focused!(world, 0);
+    assert_eq!(
+        world.query::<&crate::ecs::Scrolling>().iter(world).count(),
+        0
+    );
+
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: 0.1,
+        fingers: 3,
+        distance_cm: 0.5,
+        elapsed_secs: None,
+    });
+    h.advance(Duration::from_millis(100));
+    let world = h.world();
+    assert_focused!(world, 1);
+    assert_eq!(
+        world.query::<&crate::ecs::Scrolling>().iter(world).count(),
+        0
+    );
+}
+
+#[test]
+fn paging_first_reveals_a_mouse_focused_window_clipped_on_the_swipe_side() {
+    let config = Config::try_from(
+        "[options]\nanimation_speed = 10000.0\n[swipe.gesture]\nfingers_count = 3\npaging = true\n",
+    )
+    .unwrap();
+    let mut h = with_paging_haptic_counter(TestHarness::new().with_config(config).with_windows(3));
+    h.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Center),
+        },
+    ]);
+    assert!(window_x(h.world(), 0) < 0);
+
+    // Centering window 1 leaves window 0 partly visible on the left. Mouse
+    // focus changes to window 0 without moving the strip.
+    h.world().write_message::<Event>(Event::MouseMoved {
+        point: CGPoint { x: 25.0, y: 400.0 },
+        modifiers: Modifiers::empty(),
+    });
+    h.advance(Duration::from_millis(100));
+    assert_focused!(h.world(), 0);
+    assert!(window_x(h.world(), 0) < 0);
+
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: -0.2,
+        fingers: 3,
+        distance_cm: -2.0,
+        elapsed_secs: None,
+    });
+    h.advance(Duration::from_millis(100));
+    assert_focused!(h.world(), 0);
+    assert_eq!(window_x(h.world(), 0), 0);
+    assert_eq!(h.world().resource::<PagingHapticCount>().0, 1);
+
+    // A further westward page at the strip edge cannot change anything.
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: -0.2,
+        fingers: 3,
+        distance_cm: -2.0,
+        elapsed_secs: None,
+    });
+    h.advance(Duration::from_millis(100));
+    assert_focused!(h.world(), 0);
+    assert_eq!(h.world().resource::<PagingHapticCount>().0, 1);
+}
+
+#[test]
+fn paging_fast_swipe_keeps_each_step_and_signed_remainder() {
+    let config = Config::try_from("[swipe.gesture]\nfingers_count = 3\npaging = true\n").unwrap();
+    let mut h = TestHarness::new().with_config(config).with_windows(4);
+    h.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: 0.3,
+        fingers: 3,
+        distance_cm: 4.5,
+        elapsed_secs: None,
+    });
+    h.advance(Duration::from_millis(100));
+    assert_focused!(h.world(), 2);
+
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: -0.1,
+        fingers: 3,
+        distance_cm: -0.6,
+        elapsed_secs: None,
+    });
+    h.advance(Duration::from_millis(40));
+    assert_focused!(h.world(), 2);
+
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: -0.2,
+        fingers: 3,
+        distance_cm: -1.9,
+        elapsed_secs: None,
+    });
+    h.advance(Duration::from_millis(100));
+    assert_focused!(h.world(), 1);
+}
+
+#[test]
+fn paging_lift_discards_only_fractional_travel() {
+    let config = Config::try_from("[swipe.gesture]\nfingers_count = 3\npaging = true\n").unwrap();
+    let mut h = TestHarness::new().with_config(config).with_windows(3);
+    h.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: 0.1,
+        fingers: 3,
+        distance_cm: 1.5,
+        elapsed_secs: None,
+    });
+    h.advance(Duration::from_millis(40));
+    h.world().write_message::<Event>(Event::TouchpadUp);
+    h.advance(Duration::from_millis(20));
+    h.world().write_message::<Event>(Event::TouchpadDown);
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: 0.1,
+        fingers: 3,
+        distance_cm: 0.6,
+        elapsed_secs: None,
+    });
+    h.advance(Duration::from_millis(100));
+    assert_focused!(h.world(), 0);
+}
+
+#[test]
+fn paging_ignores_a_stale_focus_request_after_gesture_reset() {
+    let config = Config::try_from("[swipe.gesture]\nfingers_count = 3\npaging = true\n").unwrap();
+    let mut h = TestHarness::new().with_config(config).with_windows(3);
+    h.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    h.world()
+        .write_message(crate::ecs::scroll::PageFocusRequest {
+            direction: crate::commands::Direction::East,
+            generation: 0,
+        });
+    h.advance(Duration::from_millis(20));
+    assert_focused!(h.world(), 0);
+}
+
+#[test]
+fn paging_respects_reversed_direction_and_strip_edges() {
+    let config = Config::try_from(
+        "[swipe.gesture]\nfingers_count = 3\npaging = true\ndirection = 'Reversed'\n",
+    )
+    .unwrap();
+    let mut h = TestHarness::new().with_config(config).with_windows(3);
+    h.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: 0.2,
+        fingers: 3,
+        distance_cm: 2.0,
+        elapsed_secs: None,
+    });
+    h.advance(Duration::from_millis(60));
+    assert_focused!(h.world(), 0);
+
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: -0.2,
+        fingers: 3,
+        distance_cm: -2.0,
+        elapsed_secs: None,
+    });
+    h.advance(Duration::from_millis(100));
+    assert_focused!(h.world(), 1);
+}
+
+#[test]
+fn paging_inactivity_resets_partial_distance() {
+    let config = Config::try_from("[swipe.gesture]\nfingers_count = 3\npaging = true\n").unwrap();
+    let mut h = TestHarness::new().with_config(config).with_windows(3);
+    h.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: 0.1,
+        fingers: 3,
+        distance_cm: 1.5,
+        elapsed_secs: None,
+    });
+    h.advance(Duration::from_millis(200));
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: 0.1,
+        fingers: 3,
+        distance_cm: 0.6,
+        elapsed_secs: None,
+    });
+    h.advance(Duration::from_millis(100));
+    assert_focused!(h.world(), 0);
+}
+
+#[test]
+fn paging_haptics_default_on_and_off_setting_only_changes_pulses() {
+    let config = Config::try_from("[swipe.gesture]\nfingers_count = 3\npaging = true\n").unwrap();
+    let mut h = with_paging_haptic_counter(TestHarness::new().with_config(config).with_windows(4));
+    h.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: 0.2,
+        fingers: 3,
+        distance_cm: 2.0,
+        elapsed_secs: None,
+    });
+    h.advance(Duration::from_millis(100));
+    assert_focused!(h.world(), 1);
+    assert_eq!(h.world().resource::<PagingHapticCount>().0, 1);
+
+    let disabled =
+        Config::try_from("[swipe.gesture]\nfingers_count = 3\npaging = true\nhaptics = false\n")
+            .unwrap();
+    h.world().insert_resource(disabled);
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: 0.2,
+        fingers: 3,
+        distance_cm: 2.0,
+        elapsed_secs: None,
+    });
+    h.advance(Duration::from_millis(100));
+    assert_focused!(h.world(), 2);
+    assert_eq!(h.world().resource::<PagingHapticCount>().0, 1);
+
+    let enabled =
+        Config::try_from("[swipe.gesture]\nfingers_count = 3\npaging = true\nhaptics = true\n")
+            .unwrap();
+    h.world().insert_resource(enabled);
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: 0.2,
+        fingers: 3,
+        distance_cm: 2.0,
+        elapsed_secs: None,
+    });
+    h.advance(Duration::from_millis(100));
+    assert_focused!(h.world(), 3);
+    assert_eq!(h.world().resource::<PagingHapticCount>().0, 2);
+
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: 0.2,
+        fingers: 3,
+        distance_cm: 2.0,
+        elapsed_secs: None,
+    });
+    h.advance(Duration::from_millis(100));
+    assert_focused!(h.world(), 3);
+    assert_eq!(h.world().resource::<PagingHapticCount>().0, 2);
+}
+
+#[test]
+fn keyboard_focus_never_requests_paging_haptics() {
+    let config = Config::try_from("[swipe.gesture]\nfingers_count = 3\npaging = true\n").unwrap();
+    let mut h = with_paging_haptic_counter(TestHarness::new().with_config(config).with_windows(3));
+    h.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+    ]);
+    assert_focused!(h.world(), 1);
+    assert_eq!(h.world().resource::<PagingHapticCount>().0, 0);
+}
+
+#[test]
+fn keyboard_focus_in_same_frame_does_not_stall_later_pages() {
+    let config = Config::try_from("[swipe.gesture]\nfingers_count = 3\npaging = true\n").unwrap();
+    let mut h = TestHarness::new().with_config(config).with_windows(4);
+    h.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    h.world().write_message::<Event>(Event::Command {
+        command: Command::Window(Operation::Focus(Direction::East)),
+    });
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: 0.2,
+        fingers: 3,
+        distance_cm: 2.0,
+        elapsed_secs: None,
+    });
+    h.advance(Duration::from_millis(16));
+    assert_focused!(h.world(), 1);
+
+    h.advance(Duration::from_millis(100));
+    assert_focused!(h.world(), 2);
+
+    h.world().write_message::<Event>(Event::Swipe {
+        delta: 0.2,
+        fingers: 3,
+        distance_cm: 2.0,
+        elapsed_secs: None,
+    });
+    h.advance(Duration::from_millis(100));
+    assert_focused!(h.world(), 3);
+}
+
+/// A swipe leaves the strip coasting; a finger on the touchpad stops it dead.
+#[test]
+fn test_scrolling_stop() {
+    let config: Config = (
+        MainOptions {
+            swipe_gesture_fingers: Some(3),
+            // Slow enough to still be coasting a whole command later.
+            swipe_deceleration: Some(0.1),
             ..Default::default()
         },
         vec![],
     )
         .into();
 
-    TestHarness::new()
-        .with_config(config)
-        .with_windows(3)
-        .on_iteration(3, |world, _state| {
-            use crate::ecs::Scrolling;
-            let mut query = world.query::<&Scrolling>();
-            let scroll = query.single(world).unwrap();
-            assert_eq!(scroll.velocity, 0.0);
-            assert!(scroll.is_user_swiping);
-        })
-        .run(commands);
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    let world = harness.world();
+    world.write_message::<Event>(Event::Swipe {
+        delta: 0.3,
+        fingers: 3,
+        distance_cm: 0.0,
+        elapsed_secs: Some(0.02),
+    });
+    world.write_message::<Event>(Event::TouchpadUp);
+    harness.advance(Duration::from_millis(20));
+    let world = harness.world();
+    let scroll = world
+        .query::<&crate::ecs::Scrolling>()
+        .single(world)
+        .expect("the strip coasts after a swipe");
+    assert!(scroll.velocity > 0.0);
+    assert!(!scroll.is_user_swiping);
+
+    world.write_message::<Event>(Event::TouchpadDown);
+    harness.advance(Duration::from_millis(20));
+    let world = harness.world();
+    let scroll = world
+        .query::<&crate::ecs::Scrolling>()
+        .single(world)
+        .expect("new touch is active");
+    assert_eq!(scroll.velocity, 0.0);
+    assert!(scroll.is_user_swiping);
+
+    harness.advance(Duration::from_millis(120));
+    let world = harness.world();
+    assert!(
+        world
+            .query::<&crate::ecs::Scrolling>()
+            .iter(world)
+            .next()
+            .is_none(),
+        "idle touch state is discarded without coasting"
+    );
 }
 
 #[test]
 fn test_window_hidden_ratio() {
-    let commands = vec![
-        Event::MenuOpened { window_id: 0 },
-        Event::Swipe {
-            delta: 0.3,
-            fingers: 3,
-        },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::First)),
-        },
-    ];
-
     let config: Config = (
         MainOptions {
             window_hidden_ratio: Some(0.5),
             animation_speed: Some(10000.0),
             swipe_gesture_fingers: Some(3),
+            swipe_sensitivity: Some(0.112),
             ..Default::default()
         },
         vec![],
     )
         .into();
 
-    TestHarness::new()
-        .with_config(config)
-        .with_windows(2)
-        .on_iteration(2, |world, _state| {
-            let entity = find_window_entity(0, world);
-            let window = world.get::<Window>(entity).expect("finding window");
-            assert!(window.frame().min.x < 0);
-        })
-        .run(commands);
+    let mut harness = TestHarness::new().with_config(config).with_windows(2);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    let world = harness.world();
+    world.write_message::<Event>(Event::Swipe {
+        delta: 0.3,
+        fingers: 3,
+        distance_cm: 0.0,
+        elapsed_secs: Some(0.02),
+    });
+    harness.advance(Duration::from_millis(20));
+    harness.world().write_message::<Event>(Event::Command {
+        command: Command::Window(Operation::Focus(Direction::First)),
+    });
+    harness.advance(Duration::from_millis(20));
+    let world = harness.world();
+    let entity = find_window_entity(0, world);
+    let window = world.get::<Window>(entity).expect("finding window");
+    assert!(window.frame().min.x < 0);
+}
+
+/// At `window_hidden_ratio = 1.0` focus moves the strip only for a window that
+/// is fully hidden. Center leaves the window next to the centered one just
+/// past the viewport edge: fully hidden, so focusing it must bring it into
+/// view. The focus arrives the way macOS reports a switch between two windows
+/// of the frontmost app: a focus notification with no app switch.
+#[test]
+fn test_hidden_ratio_one_reveals_a_window_just_past_the_edge() {
+    // (window to center, window to focus, focused window's x once in view)
+    for (centered, focused, revealed_x) in [(0, 2, TEST_DISPLAY_WIDTH - 512), (2, 0, 0)] {
+        let commands = vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::Window(Operation::Focus(if centered == 0 {
+                    Direction::First
+                } else {
+                    Direction::Last
+                })),
+            },
+            Event::Command {
+                command: Command::Window(Operation::Center),
+            },
+            Event::WindowFocused { window_id: focused },
+        ];
+
+        let config: Config = (
+            MainOptions {
+                window_hidden_ratio: Some(1.0),
+                animation_speed: Some(10000.0),
+                ..Default::default()
+            },
+            vec![],
+        )
+            .into();
+
+        TestHarness::new()
+            .with_config(config)
+            .with_window(0, |window| window.frame.max.x = 512)
+            .with_window(1, |window| window.frame.max.x = 256)
+            .with_window(2, |window| window.frame.max.x = 512)
+            .on_iteration(2, move |world, state| {
+                // The centered window spans 256..768, so the 256 px middle
+                // window fills the rest of its side and the outer window
+                // starts or ends exactly at the viewport edge.
+                assert_window_at!(world, centered, 256, TEST_MENUBAR_HEIGHT);
+                let middle = window_x(world, 1);
+                assert!(middle == 0 || middle == 768, "middle window at {middle}");
+                state.set_focused_window(focused);
+            })
+            .on_iteration(3, move |world, _state| {
+                assert_focused!(world, focused);
+                assert_window_at!(world, focused, revealed_x, TEST_MENUBAR_HEIGHT);
+            })
+            .run(commands);
+    }
+}
+
+/// A window the running Center animation is about to hide must come into view
+/// on focus, the same as when focus arrives after the animation settles.
+#[test]
+fn test_hidden_ratio_one_reveals_focus_during_center_animation() {
+    for center_duration in [Duration::from_secs(3), Duration::from_millis(60)] {
+        let config: Config = (
+            MainOptions {
+                window_hidden_ratio: Some(1.0),
+                animation_speed: Some(8.0),
+                ..Default::default()
+            },
+            vec![],
+        )
+            .into();
+        let mut harness = TestHarness::new().with_config(config).with_windows(3);
+        harness.run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::Window(Operation::Focus(Direction::First)),
+            },
+        ]);
+        harness.world().write_message(Event::Command {
+            command: Command::Window(Operation::Center),
+        });
+        harness.advance(center_duration);
+        harness.mock_state.set_focused_window(2);
+        harness
+            .world()
+            .write_message(Event::WindowFocused { window_id: 2 });
+        harness.advance(Duration::from_secs(3));
+
+        assert_focused!(harness.world(), 2);
+        assert_eq!(
+            window_x(harness.world(), 2),
+            TEST_DISPLAY_WIDTH - TEST_WINDOW_WIDTH,
+            "focus {center_duration:?} into the Center animation"
+        );
+    }
 }
 
 #[test]
@@ -662,6 +1559,182 @@ fn test_external_focus_reactivates_hidden_virtual_strip_when_marker_is_stale() {
         .run(commands);
 }
 
+#[test]
+fn test_external_focus_switch_flashes_workspace_number() {
+    TestHarness::new()
+        .with_windows(1)
+        .on_iteration(1, |world, _state| {
+            let mut messages = world.query::<&crate::ecs::FlashMessage>();
+            assert!(
+                messages.iter(world).any(|message| message.0 == "2"),
+                "a Paneru workspace command should still flash the destination number"
+            );
+        })
+        .on_iteration(2, |world, _state| {
+            let mut messages = world.query::<&crate::ecs::FlashMessage>();
+            assert!(
+                messages.iter(world).any(|message| message.0 == "1"),
+                "returning to workspace 1 through external focus should flash its number"
+            );
+        })
+        .run(vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::Window(Operation::VirtualNumber(1)),
+            },
+            Event::WindowFocused { window_id: 0 },
+        ]);
+}
+
+#[test]
+fn test_native_space_switch_flashes_workspace_number() {
+    let other_space = TEST_WORKSPACE_ID + 1;
+    TestHarness::new()
+        .with_display(
+            TEST_DISPLAY_ID,
+            IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+            vec![TEST_WORKSPACE_ID, other_space],
+        )
+        .on_iteration(0, move |_world, state| {
+            state.activate_workspace(TEST_DISPLAY_ID, other_space, false);
+        })
+        .on_iteration(1, |world, _state| {
+            let mut messages = world.query::<&crate::ecs::FlashMessage>();
+            assert!(
+                messages.iter(world).any(|message| message.0 == "1"),
+                "switching macOS Spaces should flash the selected virtual workspace number"
+            );
+        })
+        .run(vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::SpaceChanged,
+        ]);
+}
+
+#[test]
+fn test_workspace_popup_uses_final_index_after_activation() {
+    TestHarness::new()
+        .with_windows(1)
+        .on_iteration(0, |world, _state| {
+            let display = world
+                .query_filtered::<Entity, With<ActiveDisplayMarker>>()
+                .single(world)
+                .expect("active display");
+            let strip = world
+                .spawn((
+                    LayoutStrip::new(TEST_WORKSPACE_ID, 0),
+                    Position(Origin::new(0, 0)),
+                    ChildOf(display),
+                    ActiveWorkspaceMarker,
+                ))
+                .id();
+            world
+                .entity_mut(strip)
+                .get_mut::<LayoutStrip>()
+                .expect("new strip")
+                .virtual_index = 1;
+        })
+        .on_iteration(1, |world, _state| {
+            let active_index = world
+                .query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>()
+                .single(world)
+                .expect("active strip")
+                .virtual_index;
+            assert_eq!(active_index, 1);
+            let mut messages = world.query::<&crate::ecs::FlashMessage>();
+            assert!(
+                messages.iter(world).any(|message| message.0 == "2"),
+                "popup should use the settled index, not the value at marker insertion"
+            );
+        })
+        .run(vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+}
+
+#[test]
+fn test_initial_workspace_does_not_flash() {
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.advance(Duration::from_millis(20));
+
+    let world = harness.world();
+    let mut messages = world.query::<&crate::ecs::FlashMessage>();
+    assert!(messages.iter(world).next().is_none());
+}
+
+#[test]
+fn test_workspace_popup_setting_disables_command_and_external_switch_flashes() {
+    let config = Config::try_from("[decorations]\nworkspace_popup_status = false\n[bindings]\n")
+        .expect("config should parse");
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(1)
+        .on_iteration(1, |world, _state| {
+            let mut messages = world.query::<&crate::ecs::FlashMessage>();
+            assert!(
+                messages.iter(world).next().is_none(),
+                "the workspace command should not flash while popups are disabled"
+            );
+        })
+        .on_iteration(2, |world, _state| {
+            let mut messages = world.query::<&crate::ecs::FlashMessage>();
+            assert!(
+                messages.iter(world).next().is_none(),
+                "external focus should not flash while popups are disabled"
+            );
+        })
+        .run(vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::Window(Operation::VirtualNumber(1)),
+            },
+            Event::WindowFocused { window_id: 0 },
+        ]);
+}
+
+#[test]
+fn test_workspace_popup_setting_disables_native_space_switch_flash() {
+    let config = Config::try_from("[decorations]\nworkspace_popup_status = false\n[bindings]\n")
+        .expect("config should parse");
+    let other_space = TEST_WORKSPACE_ID + 1;
+
+    TestHarness::new()
+        .with_config(config)
+        .with_display(
+            TEST_DISPLAY_ID,
+            IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+            vec![TEST_WORKSPACE_ID, other_space],
+        )
+        .on_iteration(0, move |_world, state| {
+            state.activate_workspace(TEST_DISPLAY_ID, other_space, false);
+        })
+        .on_iteration(1, |world, _state| {
+            let mut messages = world.query::<&crate::ecs::FlashMessage>();
+            assert!(
+                messages.iter(world).next().is_none(),
+                "macOS Space switches should not flash while popups are disabled"
+            );
+        })
+        .run(vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::SpaceChanged,
+        ]);
+}
+
 // When the focused window leaves the active strip (e.g. it just became
 // floating, or the OS handed focus to an off-strip window), window_focus
 // east/west must enter the strip from the appropriate side rather than
@@ -684,11 +1757,7 @@ fn active_strip_first_id(world: &mut World) -> i32 {
     let entity = {
         let mut q = world.query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>();
         let strip = q.single(world).expect("a single active strip");
-        strip
-            .first()
-            .expect("strip should have a column")
-            .top()
-            .expect("column should have a top entity")
+        strip.first().expect("strip should have a column")
     };
     entity_to_window_id(world, entity)
 }
@@ -697,11 +1766,7 @@ fn active_strip_last_id(world: &mut World) -> i32 {
     let entity = {
         let mut q = world.query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>();
         let strip = q.single(world).expect("a single active strip");
-        strip
-            .last()
-            .expect("strip should have a column")
-            .top()
-            .expect("column should have a top entity")
+        strip.last().expect("strip should have a column")
     };
     entity_to_window_id(world, entity)
 }
@@ -877,6 +1942,32 @@ fn test_silent_accessibility_list_does_not_fold_visible_windows() {
     let mut strips = world.query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>();
     let strip = strips.single(world).expect("one active strip");
     assert_eq!(strip.len(), 2, "both windows keep their own column");
+}
+
+/// Without an overlapping column-top pair on the active strip,
+/// `regroup_stray_native_tabs` must not touch `windows_on_screen` or
+/// `ax_window_ids` on its periodic timer.
+#[test]
+fn test_regroup_stray_native_tabs_skips_os_queries_without_overlapping_columns() {
+    use crate::manager::{MockWindowManagerApi, WindowManager};
+    use std::time::Duration;
+
+    let mut harness = TestHarness::new().with_windows(2);
+    harness.advance(Duration::from_millis(100));
+
+    // Replace WindowManager with a strict mock that panics if
+    // `windows_on_screen` is called when no columns share a frame.
+    let mut wm = MockWindowManagerApi::new();
+    wm.expect_windows_on_screen().never();
+    wm.expect_window_is_unordered().returning(|_| false);
+    wm.expect_present_displays().returning(Vec::new);
+    harness
+        .app
+        .world_mut()
+        .insert_resource(WindowManager(Box::new(wm)));
+
+    // Advance past the 1-second CLOSED_WINDOW_CHECK_FREQ timer.
+    harness.advance(Duration::from_millis(1100));
 }
 
 /// An app with native tabs answers "which window is focused?" with whichever
@@ -1121,15 +2212,101 @@ fn toggle_floating_layer_flips_state() {
         .with_config(Config::default())
         .with_windows(3)
         .on_iteration(0, |world, _state| {
-            assert!(!current_layer(world).front);
+            assert!(current_layer(world).front, "floats start in front");
         })
         .on_iteration(1, |world, _state| {
-            assert!(current_layer(world).front);
-        })
-        .on_iteration(2, |world, _state| {
             assert!(!current_layer(world).front);
         })
+        .on_iteration(2, |world, _state| {
+            assert!(current_layer(world).front);
+        })
         .run(commands);
+}
+
+/// Raising the strip on coming back to a virtual workspace buries every float
+/// behind the tiles: it raises each visible tile, so a float that sat over
+/// them ends up under all of them. Floats go back over the other tiles
+/// afterwards, still under the focused window, unless the layer was sent
+/// behind on purpose.
+fn raises_after_switching_back(layer_behind: bool) -> (Vec<WinID>, WinID) {
+    let config = Config::try_from(
+        r#"
+[options]
+
+[bindings]
+
+[windows.dialogs]
+title = ".*"
+subrole = "AXDialog"
+floating = true
+"#,
+    )
+    .expect("config should parse");
+
+    // Window 0 goes to workspace 1, which leaves it holding the focus when
+    // workspace 0 is shown again.
+    let mut commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
+        },
+    ];
+    if layer_behind {
+        commands.push(Event::Command {
+            command: Command::Window(Operation::ToggleFloatingLayer),
+        });
+    }
+    commands.extend([
+        Event::Command {
+            command: Command::Window(Operation::VirtualNumber(1)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::VirtualNumber(0)),
+        },
+    ]);
+    let (away, back) = (commands.len() - 2, commands.len() - 1);
+
+    let seen = std::rc::Rc::new(std::cell::RefCell::new((Vec::new(), 0)));
+    let read = seen.clone();
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(5)
+        .with_window(9, |window| window.subrole = "AXDialog".to_string())
+        .on_iteration(away, |_world, state| {
+            // Whatever the way there raised doesn't count.
+            let _ = state.take_raised();
+        })
+        .on_iteration(back, move |world, state| {
+            let mut query = world.query::<(&Window, Has<crate::ecs::FocusedMarker>)>();
+            let focused = query
+                .iter(world)
+                .find_map(|(window, focused)| focused.then_some(window.id()))
+                .expect("a window is focused");
+            *read.borrow_mut() = (state.take_raised(), focused);
+        })
+        .run(commands);
+    let seen = seen.borrow();
+    (seen.0.clone(), seen.1)
+}
+
+#[test]
+fn switching_back_raises_floats_over_the_tiles_and_under_the_focused_one() {
+    let (raised, focused) = raises_after_switching_back(false);
+    assert!(raised.contains(&9), "the float is raised again: {raised:?}");
+    assert_eq!(raised.last(), Some(&focused), "focused is raised last");
+    // Every tile but the focused one comes before the float.
+    assert_eq!(
+        raised.iter().rev().nth(1),
+        Some(&9),
+        "the float is raised just before the focused: {raised:?}"
+    );
+}
+
+#[test]
+fn switching_back_leaves_floats_behind_when_the_layer_is() {
+    let (raised, _) = raises_after_switching_back(true);
+    assert!(!raised.is_empty(), "the strip is raised");
+    assert!(!raised.contains(&9), "the float stays behind: {raised:?}");
 }
 
 #[test]
@@ -1187,6 +2364,9 @@ fn focus_unmanaged_ignores_floats_from_other_workspaces() {
         Event::Command {
             command: Command::Window(Operation::Focus(Direction::East)),
         },
+        Event::Command {
+            command: Command::Window(Operation::FocusUnmanaged),
+        },
     ];
 
     harness
@@ -1218,15 +2398,17 @@ fn test_mid_strip_insertion_preserves_window_x() {
         MainOptions {
             insert_windows_mid_strip: Some(true),
             swipe_gesture_fingers: Some(3),
+            swipe_sensitivity: Some(0.112),
+            swipe_deceleration: Some(2.0),
+            auto_center: Some(false),
             ..Default::default()
         },
         vec![],
     )
         .into();
 
-    let harness = TestHarness::new().with_config(config).with_windows(8);
-
-    let commands = vec![
+    let mut harness = TestHarness::new().with_config(config).with_windows(8);
+    harness.run(vec![
         Event::MenuOpened { window_id: 0 },
         // Build VW1 with four windows (scrollable), leaving four on VW0.
         Event::Command {
@@ -1241,58 +2423,50 @@ fn test_mid_strip_insertion_preserves_window_x() {
         Event::Command {
             command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
         },
-        // Scroll VW0 slightly to randomize the positions. "Slightly" is the
-        // point: a single event's delta is viewport-fractions travelled in one
-        // frame, so the velocity it yields is `delta / dt`. Anything much
-        // larger throws the strip into its clamp bound, which parks the
-        // focused window at an edge sliver and makes the offset compared below
-        // that fixed sliver rather than a real layout position.
-        Event::Swipe {
-            delta: 0.06,
-            fingers: 3,
-        },
-        // Used as a noop to let the scroll settle.
-        Event::MenuOpened { window_id: 0 },
-        // Change to VW1 and scroll it slightly as well.
-        Event::Command {
-            command: Command::Window(Operation::VirtualNumber(1)),
-        },
-        Event::Swipe {
-            delta: 0.04,
-            fingers: 3,
-        },
-        Event::MenuOpened { window_id: 0 },
-        // Change back to VW0 and send one window over to VW1.
-        Event::Command {
-            command: Command::Window(Operation::VirtualNumber(0)),
-        },
-        Event::Command {
-            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Follow)),
-        },
-        Event::Command {
-            command: Command::PrintState,
-        },
-    ];
+    ]);
 
-    let previous_offset = std::rc::Rc::new(std::cell::RefCell::new(0));
-    let previous_offset2 = previous_offset.clone();
-    harness
-        .on_iteration(10, move |world, _state| {
-            let mut q =
-                world.query_filtered::<(&Window, &Position), With<crate::ecs::FocusedMarker>>();
-            let (_, position) = q.single(world).expect("a focused window");
+    // Scroll VW0 slightly, then lift in the same frame. The destination
+    // offset must be non-grid-aligned for this insertion regression.
+    let world = harness.world();
+    world.write_message::<Event>(Event::Swipe {
+        delta: 0.0375,
+        fingers: 3,
+        distance_cm: 0.0,
+        elapsed_secs: Some(0.02),
+    });
+    world.write_message::<Event>(Event::TouchpadUp);
+    harness.advance(Duration::from_millis(1500));
+    harness.run(vec![Event::Command {
+        command: Command::Window(Operation::VirtualNumber(1)),
+    }]);
 
-            previous_offset.replace(position.x);
-            assert_ne!(position.x, 0);
-        })
-        .on_iteration(11, move |world, _state| {
-            let mut q =
-                world.query_filtered::<(&Window, &Position), With<crate::ecs::FocusedMarker>>();
-            let (_, position) = q.single(world).expect("a focused window");
+    let world = harness.world();
+    world.write_message::<Event>(Event::Swipe {
+        delta: 0.025,
+        fingers: 3,
+        distance_cm: 0.0,
+        elapsed_secs: Some(0.02),
+    });
+    world.write_message::<Event>(Event::TouchpadUp);
+    harness.advance(Duration::from_millis(1500));
+    harness.run(vec![Event::Command {
+        command: Command::Window(Operation::VirtualNumber(0)),
+    }]);
 
-            assert_eq!(position.x, previous_offset2.take());
-        })
-        .run(commands);
+    let previous_offset = {
+        let world = harness.world();
+        let mut q = world.query_filtered::<(&Window, &Position), With<crate::ecs::FocusedMarker>>();
+        let (_, position) = q.single(world).expect("a focused window");
+        assert_ne!(position.x, 0);
+        position.x
+    };
+    harness.run(vec![Event::Command {
+        command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Follow)),
+    }]);
+    let world = harness.world();
+    let mut q = world.query_filtered::<(&Window, &Position), With<crate::ecs::FocusedMarker>>();
+    let (_, position) = q.single(world).expect("a focused window");
+    assert_eq!(position.x, previous_offset);
 }
 
 /// Without the flag (the default), a moved window is appended to the end of the
@@ -1448,6 +2622,8 @@ fn test_mid_strip_move_does_not_animate() {
     h.app.world_mut().write_message::<Event>(Event::Swipe {
         delta: 0.3,
         fingers: 3,
+        distance_cm: 0.0,
+        elapsed_secs: None,
     });
     for _ in 0..6 {
         h.app.update();
@@ -1459,6 +2635,8 @@ fn test_mid_strip_move_does_not_animate() {
     h.app.world_mut().write_message::<Event>(Event::Swipe {
         delta: 0.3,
         fingers: 3,
+        distance_cm: 0.0,
+        elapsed_secs: None,
     });
     for _ in 0..6 {
         h.app.update();
@@ -1534,6 +2712,8 @@ fn test_virtual_workspace_switch_no_horizontal_slide_no_animations() {
         Event::Swipe {
             delta: 0.3,
             fingers: 3,
+            distance_cm: 0.0,
+            elapsed_secs: None,
         },
     );
 
@@ -2076,6 +3256,8 @@ fn test_virtual_workspace_switch_stops_in_flight_strip_animation() {
     h.app.world_mut().write_message::<Event>(Event::Swipe {
         delta: 0.3,
         fingers: 3,
+        distance_cm: 0.0,
+        elapsed_secs: None,
     });
     // One frame to start the animation.
     h.app.update();
@@ -2376,6 +3558,8 @@ fn test_virtual_workspace_switch_preserves_scroll_with_animations() {
         Event::Swipe {
             delta: 0.4,
             fingers: 3,
+            distance_cm: 0.0,
+            elapsed_secs: None,
         },
     );
 
@@ -2475,13 +3659,14 @@ fn test_virtual_workspace_switch_hides_old_strip_with_animations() {
 /// the edges.
 #[test]
 fn test_stack_unstack_brings_focused_window_into_view() {
-    fn check_if_offscreen(world: &mut World, _state: MockState) {
+    fn check_if_offscreen(world: &mut World) {
         let mut q = world.query_filtered::<(&Window, &Position), With<crate::ecs::FocusedMarker>>();
         let (_, position) = q.single(world).expect("a focused window");
 
         assert!(
             position.x < -(TEST_WINDOW_WIDTH / 4),
-            "focused window should be somewhat offscreen after the scroll."
+            "focused window should be somewhat offscreen after the scroll, got x={}",
+            position.x
         );
     }
 
@@ -2498,48 +3683,59 @@ fn test_stack_unstack_brings_focused_window_into_view() {
         .into();
 
     // 5 windows @ 400px = 2000px strip on a 1024px display → scrollable.
-    let harness = TestHarness::new().with_config(config).with_windows(5);
-
-    let commands = vec![
+    let mut harness = TestHarness::new().with_config(config).with_windows(5);
+    harness.run(vec![
         Event::MenuOpened { window_id: 0 },
         Event::Command {
             command: Command::Window(Operation::Focus(Direction::East)),
         },
-        // Swipe windows 0 and 1 off screen.
-        Event::Swipe {
-            delta: 0.3,
-            fingers: 3,
-        },
-        // Noop to let the scroll settle.
-        Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::Window(Operation::Stack(true)),
-        },
-        // Now swipe the stacked windows off screen again.
-        Event::Swipe {
-            delta: 0.1,
-            fingers: 3,
-        },
-        // Noop to let the scroll settle.
-        Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::Window(Operation::Stack(false)),
-        },
-    ];
+    ]);
 
-    harness
-        .on_iteration(3, check_if_offscreen)
-        .on_iteration(4, |world, _state| {
-            // Check that both window are stacked and moved into view.
-            assert_window_at!(world, 0, 0, 20);
-            assert_window_at!(world, 1, 0, 394);
-        })
-        .on_iteration(5, check_if_offscreen)
-        .on_iteration(7, |world, _state| {
-            // Check that both window are stacked and moved into view.
-            assert_window_at!(world, 1, 0, 20);
-        })
-        .run(commands);
+    // Swipe and lift in the same frame so the coast begins before the harness's
+    // 500ms command window can discard an idle touch.
+    let world = harness.world();
+    world.write_message::<Event>(Event::Swipe {
+        delta: 0.3,
+        fingers: 3,
+        distance_cm: 0.0,
+        elapsed_secs: Some(0.02),
+    });
+    world.write_message::<Event>(Event::TouchpadUp);
+    harness.advance(Duration::from_millis(120));
+    check_if_offscreen(harness.world());
+
+    harness.world().write_message::<Event>(Event::Command {
+        command: Command::Window(Operation::Stack(true)),
+    });
+    harness.advance(Duration::from_millis(500));
+    let world = harness.world();
+    assert_window_at!(world, 0, 0, 20);
+    assert_window_at!(world, 1, 0, 394);
+
+    let world = harness.world();
+    world.write_message::<Event>(Event::Swipe {
+        delta: 0.1,
+        fingers: 3,
+        distance_cm: 0.0,
+        elapsed_secs: Some(0.02),
+    });
+    world.write_message::<Event>(Event::TouchpadUp);
+    harness.advance(Duration::from_millis(80));
+    check_if_offscreen(harness.world());
+
+    harness.world().write_message::<Event>(Event::Command {
+        command: Command::Window(Operation::Stack(false)),
+    });
+    harness.advance(Duration::from_millis(500));
+    let world = harness.world();
+    let entity = find_window_entity(1, world);
+    let frame = world
+        .get::<Window>(entity)
+        .expect("unstacked window")
+        .frame();
+    assert!(frame.min.x >= 0);
+    assert!(frame.max.x <= TEST_DISPLAY_WIDTH);
+    assert_eq!(frame.min.y, 20);
 }
 
 /// A window parked on a hidden virtual row must stay parked when its app
@@ -2818,6 +4014,50 @@ fn test_auto_discover_unmanaged_focused_window() {
         .run(events);
 }
 
+/// Discovery asks only the app that owns the focused window, as the window
+/// server has it: asking the others in turn held every keystroke behind the
+/// input tap for as long as the unresponsive ones took to time out.
+#[test]
+fn test_auto_discover_asks_only_the_owner() {
+    const OWNER: Pid = TEST_PROCESS_ID + 1;
+    let events = vec![
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::WindowFocused { window_id: 1 },
+    ];
+
+    TestHarness::new()
+        .with_windows(1)
+        .with_app(OWNER, "owner", "Owner", |app| app.is_frontmost = false)
+        .on_iteration(0, |_world, state| {
+            state.spawn_window(
+                OWNER,
+                TEST_WORKSPACE_ID,
+                1,
+                bevy::math::IRect::from_corners(
+                    bevy::math::IVec2::new(0, 0),
+                    bevy::math::IVec2::new(400, 400),
+                ),
+            );
+            state.update_app(OWNER, |app| app.focused_window_id = Some(1));
+            state.take_app_reads(TEST_PROCESS_ID);
+        })
+        .on_iteration(1, |world, state| {
+            let mut query = world.query::<&crate::manager::Window>();
+            assert!(
+                query.iter(world).any(|w| w.id() == 1),
+                "Window 1 should be discovered in the app that owns it"
+            );
+            assert_eq!(
+                state.take_app_reads(TEST_PROCESS_ID),
+                0,
+                "The frontmost app doesn't own window 1 and shouldn't be asked"
+            );
+        })
+        .run(events);
+}
+
 /// The centering config the manual-offset tests share: `auto_center` off and
 /// `continuous_swipe` off is the combination that arms the edge invariant in
 /// `reshuffle_layout_strip`, which is what used to snap a centered strip back
@@ -3053,6 +4293,8 @@ fn test_center_dropped_on_user_swipe() {
         Event::Swipe {
             delta: -0.2,
             fingers: 3,
+            distance_cm: 0.0,
+            elapsed_secs: None,
         },
     ];
 
@@ -3287,58 +4529,52 @@ fn test_copy_window_rule_command() {
 /// could never switch back to workspace "1".
 #[test]
 fn test_virtual_number_recreates_missing_baseline_row() {
-    let mut h = TestHarness::new().with_windows(2);
-    let pump = |h: &mut TestHarness, c: Command| {
-        h.app
-            .world_mut()
-            .write_message::<Event>(Event::Command { command: c });
-        for _ in 0..8 {
-            h.app.update();
-            for e in h.mock_state.drain_events() {
-                h.app.world_mut().write_message::<Event>(e);
-            }
-        }
-    };
+    let commands = vec![
+        Event::Command {
+            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Follow)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Follow)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::VirtualNumber(0)),
+        },
+    ];
 
     // Move both windows onto row 1 and switch there, then drop row 0 the way a
     // display change does, leaving the space numbered from "2".
-    for _ in 0..2 {
-        pump(
-            &mut h,
-            Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Follow)),
-        );
-    }
-    let world = h.world();
-    let row_zero = world
-        .query::<(Entity, &LayoutStrip)>()
-        .iter(world)
-        .find(|(_, strip)| strip.virtual_index == 0)
-        .map(|(entity, _)| entity)
-        .expect("row 0 should still exist before it is dropped");
-    world.entity_mut(row_zero).despawn();
+    TestHarness::new()
+        .with_windows(2)
+        .on_iteration(1, |world, _state| {
+            let row_zero = world
+                .query::<(Entity, &LayoutStrip)>()
+                .iter(world)
+                .find(|(_, strip)| strip.virtual_index == 0)
+                .map(|(entity, _)| entity)
+                .expect("row 0 should still exist before it is dropped");
+            world.entity_mut(row_zero).despawn();
 
-    let world = h.world();
-    let indexes = world
-        .query::<&LayoutStrip>()
-        .iter(world)
-        .map(|strip| strip.virtual_index)
-        .collect::<Vec<_>>();
-    assert_eq!(indexes, vec![1], "only row 1 should be left");
-
-    pump(&mut h, Command::Window(Operation::VirtualNumber(0)));
-
-    let world = h.world();
-    let recreated = world
-        .query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>()
-        .iter(world)
-        .filter(|(strip, _)| strip.virtual_index == 0)
-        .map(|(_, active)| active)
-        .collect::<Vec<_>>();
-    assert_eq!(
-        recreated,
-        vec![true],
-        "virtualnum 0 should recreate row 0 and make it active"
-    );
+            let indexes = world
+                .query::<&LayoutStrip>()
+                .iter(world)
+                .map(|strip| strip.virtual_index)
+                .collect::<Vec<_>>();
+            assert_eq!(indexes, vec![1], "only row 1 should be left");
+        })
+        .on_iteration(2, |world, _state| {
+            let recreated = world
+                .query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>()
+                .iter(world)
+                .filter(|(strip, _)| strip.virtual_index == 0)
+                .map(|(_, active)| active)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                recreated,
+                vec![true],
+                "virtualnum 0 should recreate row 0 and make it active"
+            );
+        })
+        .run(commands);
 }
 
 /// Moving a window to a missing row spawns it — row 0 included. Row 0 used to
@@ -3346,55 +4582,547 @@ fn test_virtual_number_recreates_missing_baseline_row() {
 /// a window back to workspace "1".
 #[test]
 fn test_virtual_move_number_recreates_missing_baseline_row() {
-    let mut h = TestHarness::new().with_windows(2);
-    let pump = |h: &mut TestHarness, c: Command| {
-        h.app
-            .world_mut()
-            .write_message::<Event>(Event::Command { command: c });
-        for _ in 0..8 {
-            h.app.update();
-            for e in h.mock_state.drain_events() {
-                h.app.world_mut().write_message::<Event>(e);
-            }
-        }
-    };
+    let commands = vec![
+        Event::Command {
+            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Follow)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Follow)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::VirtualMoveNumber(0, MoveFocus::Follow)),
+        },
+    ];
 
     // Park both windows on row 1 and drop the emptied row 0 the way a display
     // change does, leaving the space numbered from "2".
-    for _ in 0..2 {
-        pump(
-            &mut h,
-            Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Follow)),
+    TestHarness::new()
+        .with_windows(2)
+        .on_iteration(1, |world, _state| {
+            let row_zero = world
+                .query::<(Entity, &LayoutStrip)>()
+                .iter(world)
+                .find(|(_, strip)| strip.virtual_index == 0)
+                .map(|(entity, _)| entity)
+                .expect("row 0 should still exist before it is dropped");
+            world.entity_mut(row_zero).despawn();
+        })
+        .on_iteration(2, |world, _state| {
+            let focused = world
+                .query_filtered::<Entity, With<FocusedMarker>>()
+                .single(world)
+                .expect("the followed window should be focused");
+            let recreated = world
+                .query::<&LayoutStrip>()
+                .iter(world)
+                .filter(|strip| strip.virtual_index == 0)
+                .map(|strip| strip.contains(focused))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                recreated,
+                vec![true],
+                "the moved window should land on a single recreated row 0"
+            );
+        })
+        .run(commands);
+}
+
+/// Issuing a keyboard focus command to an off-edge window must compute the
+/// strip target, project all window targets against that strip target, and
+/// advance their positions on the very first `app.update()` frame (Frame 0),
+/// rather than lagging by extra frames.
+#[test]
+fn test_focus_command_starts_animation_on_first_frame() {
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(10.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    let initial_strip_x = {
+        let world = harness.world();
+        world
+            .query_filtered::<&Position, With<ActiveWorkspaceMarker>>()
+            .single(world)
+            .expect("active strip")
+            .x
+    };
+    let initial_win0_x = {
+        let world = harness.world();
+        let entity = find_window_entity(0, world);
+        world.get::<Position>(entity).expect("window 0 pos").x
+    };
+
+    // Issue Focus(Last) to move focus from window 0 (at index 0) to window 2
+    // (at index 2, x=800..1200, partially offscreen right), scrolling the strip on Frame 0.
+    harness
+        .app
+        .world_mut()
+        .write_message::<Event>(Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Last)),
+        });
+
+    // Run a single frame (Frame 0).
+    harness.app.update();
+
+    let world = harness.world();
+    let (strip_pos, strip_reposition) = world
+        .query_filtered::<(&Position, Option<&RepositionMarker>), With<ActiveWorkspaceMarker>>()
+        .single(world)
+        .expect("active strip");
+    assert!(
+        strip_reposition.is_some(),
+        "active strip should have RepositionMarker on Frame 0"
+    );
+    assert_ne!(
+        strip_pos.x, initial_strip_x,
+        "active strip should already have advanced on Frame 0"
+    );
+
+    let win0_entity = find_window_entity(0, world);
+    let win0_pos = world.get::<Position>(win0_entity).expect("window 0 pos");
+    let win0_reposition = world.get::<RepositionMarker>(win0_entity);
+    assert!(
+        win0_reposition.is_some(),
+        "window 0 should have RepositionMarker on Frame 0"
+    );
+    assert_ne!(
+        win0_pos.x, initial_win0_x,
+        "window 0 should already have advanced on Frame 0"
+    );
+}
+
+// Captured live Emacs relaunch failed registration before an
+// Application entity existed. Retry the same observer rather than recreating it.
+#[test]
+fn observer_registration_failure_keeps_application() {
+    observer_registration_recovery(true);
+}
+
+#[test]
+fn observer_registration_partial_keeps_application() {
+    observer_registration_recovery(false);
+}
+
+fn observer_registration_recovery(all_failed: bool) {
+    use crate::ecs::{BProcess, FreshMarker};
+    use crate::manager::{Application, WindowManager};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.advance(Duration::from_secs(1));
+    let pid = 44;
+    harness.mock_state.spawn_app(pid, "org.gnu.Emacs", "Emacs");
+    let ready = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut wm = harness.mock_state.create_window_manager();
+    let state = harness.mock_state.clone();
+    let app_ready = ready.clone();
+    let app_calls = calls.clone();
+    wm.expect_new_application()
+        .times(1)
+        .returning(move |process| {
+            let ready = app_ready.clone();
+            let calls = app_calls.clone();
+            Ok(
+                state.create_application_with_observer(process.pid(), move || {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    if ready.load(Ordering::Relaxed) {
+                        Ok(true)
+                    } else if all_failed {
+                        Err(crate::errors::Error::Generic(
+                            "AX temporarily unavailable".into(),
+                        ))
+                    } else {
+                        Ok(false)
+                    }
+                }),
+            )
+        });
+    harness.world().insert_resource(WindowManager(Box::new(wm)));
+    let process = harness.mock_state.create_process(pid);
+    harness
+        .world()
+        .spawn((BProcess(Box::new(process)), FreshMarker));
+    harness.advance(Duration::from_millis(200));
+    let world = harness.world();
+    assert!(
+        world
+            .query::<&Application>()
+            .iter(world)
+            .any(|app| app.pid() == pid),
+        "failed registration must retain Application and its observer"
+    );
+
+    harness.advance(Duration::from_secs(12));
+    // Poll windows independently of successful subscription. There is no
+    // creation/focus notification to rescue this launch.
+    harness.mock_state.spawn_window(
+        pid,
+        TEST_WORKSPACE_ID,
+        44,
+        IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT),
+    );
+    harness.advance(Duration::from_secs(2));
+    find_window_entity(44, harness.world());
+    assert!(calls.load(Ordering::Relaxed) > 1, "registration must retry");
+
+    ready.store(true, Ordering::Relaxed);
+    harness.advance(Duration::from_secs(2));
+    let settled_calls = calls.load(Ordering::Relaxed);
+    harness.advance(Duration::from_secs(2));
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        settled_calls,
+        "successful registration must stop retrying"
+    );
+}
+
+/// Exit cleanup must leave a floating window exactly where the user put it,
+/// while a tiled window parked off-screen still comes back onto a display.
+///
+/// Driven directly at the system: sending `AppExit` through the full schedule
+/// also runs the state-saving exit systems, which write the real user state
+/// file.
+#[test]
+fn test_exit_cleanup_leaves_floating_windows_in_place() {
+    use bevy::app::AppExit;
+    use bevy::ecs::system::RunSystemOnce as _;
+
+    const FLOAT_PID: Pid = TEST_PROCESS_ID + 1;
+    const TILED: WinID = 0;
+    const FLOATING: WinID = 1;
+
+    let mut params = WindowParams::new(".*", Some("float.app".to_string()));
+    params.floating = Some(true);
+    let config: Config = (MainOptions::default(), vec![params]).into();
+
+    let mut harness =
+        TestHarness::new()
+            .with_config(config)
+            .with_app(FLOAT_PID, "float.app", "FloatApp", |_| {});
+    let state = harness.mock_state.clone();
+    let tiled = state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        TILED,
+        IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT),
+    );
+    let floating = state.spawn_window(
+        FLOAT_PID,
+        TEST_WORKSPACE_ID,
+        FLOATING,
+        IRect::new(37, 41, 37 + 300, 41 + 200),
+    );
+    harness
+        .world()
+        .trigger(SpawnWindowTrigger(vec![tiled, floating]));
+    harness.advance(Duration::from_secs(1));
+
+    let world = harness.world();
+    let floating_entity = find_window_entity(FLOATING, world);
+    assert!(
+        matches!(
+            world.entity(floating_entity).get::<Unmanaged>(),
+            Some(Unmanaged::Floating)
+        ),
+        "the floating rule should apply"
+    );
+
+    // A scrolled strip parks tiled windows past the display edge.
+    state.os_move_window(TILED, Origin::new(TEST_DISPLAY_WIDTH + 500, 100));
+
+    world.write_message(AppExit::Success);
+    world
+        .run_system_once(crate::ecs::systems::cleanup_on_exit)
+        .expect("running cleanup_on_exit");
+
+    let frame_of = |world: &mut World, id: WinID| {
+        world
+            .query::<&Window>()
+            .iter(world)
+            .find(|window| window.id() == id)
+            .expect("window exists")
+            .frame()
+    };
+
+    assert_eq!(
+        frame_of(world, FLOATING),
+        IRect::new(37, 41, 337, 241),
+        "exit cleanup must not move or resize a floating window"
+    );
+
+    let display = IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT);
+    let tiled_frame = frame_of(world, TILED);
+    assert!(
+        display.contains(tiled_frame.min) && display.contains(tiled_frame.max),
+        "exit cleanup must bring a tiled window fully onto a display, got {tiled_frame:?}"
+    );
+}
+
+/// Exit cleanup must leave a minimized window's frame alone, so it comes back
+/// where it was when the user restores it.
+#[test]
+fn test_exit_cleanup_leaves_minimized_windows_in_place() {
+    use bevy::app::AppExit;
+    use bevy::ecs::system::RunSystemOnce as _;
+
+    const MINIMIZED: WinID = 1;
+
+    let mut harness = TestHarness::new().with_windows(2);
+    harness.advance(Duration::from_secs(1));
+    let state = harness.mock_state.clone();
+    state.os_minimize_window(MINIMIZED, true);
+    harness.advance(Duration::from_secs(1));
+
+    let world = harness.world();
+    let entity = find_window_entity(MINIMIZED, world);
+    assert!(
+        matches!(
+            world.entity(entity).get::<Unmanaged>(),
+            Some(Unmanaged::Minimized)
+        ),
+        "the window should be minimized"
+    );
+    let before = world
+        .entity(entity)
+        .get::<Window>()
+        .expect("window")
+        .frame();
+
+    world.write_message(AppExit::Success);
+    world
+        .run_system_once(crate::ecs::systems::cleanup_on_exit)
+        .expect("running cleanup_on_exit");
+
+    let after = world
+        .entity(entity)
+        .get::<Window>()
+        .expect("window")
+        .frame();
+    assert_eq!(
+        after, before,
+        "exit cleanup must not move or resize a minimized window"
+    );
+}
+
+/// Hiding an app marks its tiled windows `Unmanaged::Hidden` but leaves their
+/// tiled frames, some of them parked at the display edge. Exit cleanup must
+/// still center them, or they come back as slivers when the user unhides the
+/// app after Paneru has quit.
+#[test]
+fn test_exit_cleanup_centers_hidden_app_windows() {
+    use bevy::app::AppExit;
+    use bevy::ecs::system::RunSystemOnce as _;
+
+    const WINDOWS: i32 = 5;
+
+    let commands = vec![
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::ApplicationHidden {
+            pid: TEST_PROCESS_ID,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(WINDOWS)
+        .on_iteration(1, |world, _state| {
+            let mut query = world.query::<(&Window, Option<&Unmanaged>)>();
+            let off_screen = query
+                .iter(world)
+                .inspect(|(window, unmanaged)| {
+                    assert!(
+                        matches!(unmanaged, Some(Unmanaged::Hidden)),
+                        "window {} should be hidden with its app",
+                        window.id()
+                    );
+                })
+                .filter(|(window, _)| window.frame().max.x > TEST_DISPLAY_WIDTH)
+                .count();
+            assert!(
+                off_screen > 0,
+                "some windows should reach past the display edge"
+            );
+
+            world.write_message(AppExit::Success);
+            world
+                .run_system_once(crate::ecs::systems::cleanup_on_exit)
+                .expect("running cleanup_on_exit");
+
+            let mut query = world.query::<&Window>();
+            let mut frames = query
+                .iter(world)
+                .map(|window| (window.id(), window.frame()))
+                .collect::<Vec<_>>();
+            frames.sort_by_key(|(id, _)| *id);
+            let centered = frames
+                .iter()
+                .map(|(id, frame)| {
+                    let origin = Origin::new(
+                        (TEST_DISPLAY_WIDTH - frame.width()) / 2,
+                        TEST_MENUBAR_HEIGHT
+                            + (TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT - frame.height()) / 2,
+                    );
+                    (*id, IRect::from_corners(origin, origin + frame.size()))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(frames.len(), WINDOWS as usize);
+            assert_eq!(
+                frames, centered,
+                "exit cleanup must center every hidden window"
+            );
+        })
+        .run(commands);
+}
+
+/// Quitting while the strip is still animating must not let the animation
+/// write over the frames exit cleanup restores in the same frame.
+#[test]
+fn test_exit_mid_animation_keeps_the_restored_frames() {
+    use bevy::app::{AppExit, Last, PostUpdate};
+    use bevy::ecs::system::RunSystemOnce;
+
+    use crate::manager::Display;
+
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(8.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new()
+        .with_config(config)
+        .with_window(0, |window| {
+            window.frame = IRect::new(100, 120, 100 + 700, 120 + 400);
+        })
+        .with_window(1, |window| {
+            window.frame = IRect::new(200, 150, 200 + 700, 150 + 300);
+        });
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness.advance(Duration::from_secs(3));
+    harness.world().write_message::<Event>(Event::Command {
+        command: Command::Window(Operation::Focus(Direction::East)),
+    });
+    harness.advance(Duration::from_millis(40));
+
+    let world = harness.world();
+    assert!(
+        world
+            .query_filtered::<(), With<RepositionMarker>>()
+            .iter(world)
+            .next()
+            .is_some(),
+        "the strip is still animating"
+    );
+
+    // One exit frame. Exit cleanup stands in for `Update`, where it used to
+    // run, because `Update`'s state-saving exit systems would write the real
+    // user state file. The animation's frame writes follow in `PostUpdate`.
+    world.write_message(AppExit::Success);
+    world
+        .run_system_once(crate::ecs::systems::cleanup_on_exit)
+        .expect("running cleanup_on_exit");
+    world.run_schedule(PostUpdate);
+    world.run_schedule(Last);
+
+    let bounds = world
+        .query::<&Display>()
+        .single(world)
+        .expect("one display")
+        .bounds();
+    for window in world.query::<&Window>().iter(world) {
+        let frame = window.frame();
+        let centered = bounds.min + (bounds.size() - frame.size()) / 2;
+        assert_eq!(
+            frame.min,
+            centered,
+            "window {} must stay centered on the display after exit, got {frame:?}",
+            window.id()
         );
     }
-    let world = h.world();
-    let row_zero = world
-        .query::<(Entity, &LayoutStrip)>()
-        .iter(world)
-        .find(|(_, strip)| strip.virtual_index == 0)
-        .map(|(entity, _)| entity)
-        .expect("row 0 should still exist before it is dropped");
-    world.entity_mut(row_zero).despawn();
+}
 
-    pump(
-        &mut h,
-        Command::Window(Operation::VirtualMoveNumber(0, MoveFocus::Follow)),
+/// AX move echoes can wake the event loop much faster than the display period.
+/// Rounded per-frame feedback used to leave reposition markers stuck forever.
+#[test]
+fn test_focus_animation_finishes_with_one_millisecond_event_intervals() {
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(16.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness
+        .app
+        .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            std::time::Duration::from_millis(1),
+        ));
+    harness.app.world_mut().write_message(Event::Command {
+        command: Command::Window(Operation::Focus(Direction::Last)),
+    });
+    harness.app.update();
+    assert!(
+        harness
+            .world()
+            .query::<&RepositionMarker>()
+            .iter(harness.world())
+            .next()
+            .is_some()
     );
+    for _ in 0..1000 {
+        harness.app.update();
+    }
+    let world = harness.world();
+    assert_eq!(world.query::<&RepositionMarker>().iter(world).count(), 0);
+    assert_focused!(world, 2);
+}
 
-    let world = h.world();
-    let focused = world
-        .query_filtered::<Entity, With<FocusedMarker>>()
-        .single(world)
-        .expect("the followed window should be focused");
-    let recreated = world
-        .query::<&LayoutStrip>()
-        .iter(world)
-        .filter(|strip| strip.virtual_index == 0)
-        .map(|strip| strip.contains(focused))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        recreated,
-        vec![true],
-        "the moved window should land on a single recreated row 0"
+/// A wakeup must update the clock in the same frame: alternating long and
+/// short pump intervals must not feed the preceding interval to animation.
+#[test]
+fn test_clock_samples_the_current_event_pump_interval() {
+    use bevy::app::First;
+    use bevy::ecs::schedule::IntoScheduleConfigs;
+    use bevy::ecs::system::{Local, ResMut};
+    use bevy::time::{Real, Time, TimeUpdateStrategy};
+
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    let start = harness
+        .world()
+        .resource::<Time<Real>>()
+        .last_update()
+        .expect("clock initialized by warm-up");
+    // Simulate the time observed when a blocking pump returns. Updating the
+    // manual clock strategy in the pump phase avoids wall-clock sleeps.
+    let intervals = [Duration::from_millis(200), Duration::from_millis(4)];
+    harness.app.add_systems(
+        First,
+        (move |mut strategy: ResMut<TimeUpdateStrategy>, mut step: Local<usize>| {
+            let elapsed: Duration = intervals[..=*step].iter().sum();
+            *strategy = TimeUpdateStrategy::ManualInstant(start + elapsed);
+            *step += 1;
+        })
+        .in_set(crate::ecs::FirstSet::Pump)
+        .after(crate::ecs::systems::pump_events),
     );
+    for interval in intervals {
+        harness.app.update();
+        let world = harness.world();
+        assert_eq!(world.resource::<Time<Real>>().delta(), interval);
+        assert_eq!(world.resource::<Time>().delta(), interval);
+    }
 }
