@@ -40,6 +40,7 @@ use crate::manager::{
 use crate::overlay::{FlashMessageManager, OverlayManager, TabIndicatorManager};
 use crate::platform::{Modifiers, PlatformCallbacks, WinID, WorkspaceId};
 
+pub mod desktop;
 pub mod display;
 pub mod focus;
 pub mod layout;
@@ -373,6 +374,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 crate::menubar::menu_bar_dirty
                     .or_eager(crate::menubar::menu_viewport_dirty)
                     .or_eager(resource_changed::<Config>)
+                    .or_eager(resource_changed::<desktop::DesktopCensus>)
                     .or_eager(resource_changed::<crate::menubar::MenuBarVisibility>),
             ),
             systems::update_tab_indicators.run_if(tab_indicators_dirty),
@@ -972,6 +974,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         .insert_non_send(watcher)
         .add_plugins(mouse::MouseEventsPlugin)
         .add_plugins(scroll::ScrollEventsPlugin)
+        .add_plugins(desktop::DesktopEventsPlugin)
         .add_plugins(workspace::WorkspaceEventsPlugin)
         .add_plugins(layout::LayoutEventsPlugin)
         .add_plugins(focus::FocusEventsPlugin)
@@ -1025,6 +1028,13 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
             overview_events,
         ))
         .insert_non_send(receiver);
+    if let Ok(desktop_bridge) = crate::manager::spaces::bridge::DesktopBridgeOS::new(mtm)
+        .inspect_err(|err| warn!("native desktop bridge unavailable: {err}"))
+    {
+        app.insert_non_send(crate::manager::spaces::DesktopBridge(Box::new(
+            desktop_bridge,
+        )));
+    }
 
     // `CONFIGURATION_FILE` is `None` exactly when an `init.lua` took the TOML
     // file out of play, so copied rules have to be written in Lua instead.
@@ -1103,10 +1113,17 @@ impl WindowProperties {
     }
 
     pub fn floating(&self) -> bool {
+        if matches!(self.desktop(), Some(crate::config::DesktopRuleTarget::All)) {
+            return true;
+        }
         self.params
             .iter()
             .find_map(|props| props.floating)
             .unwrap_or(false)
+    }
+
+    pub fn desktop(&self) -> Option<crate::config::DesktopRuleTarget> {
+        self.params.iter().find_map(|props| props.desktop)
     }
 
     pub fn insertion(&self) -> Option<usize> {
