@@ -20,12 +20,21 @@ By default, Paneru looks for a Lua script in the following locations (in order):
 
 Like the TOML config, the script is automatically reloaded when the file is saved.
 
+Paneru provides the `paneru` table as a global in `init.lua`. You can also write
+`local paneru = require("paneru")` there; it returns the same embedded API and
+does not need a separate `paneru.so` file. The loadable `paneru.so` client module
+is only for Lua scripts run outside Paneru. Installing the Paneru executable
+with `cargo install` does not install that separate module.
+
 ```lua
 paneru.on("window_focused", function(event, ws)
   paneru.run("window balance")
 end)
 
 paneru.bind("alt - j", "window focus east")
+
+-- Any command works from a script too, e.g. toggling the overview:
+paneru.bind("alt - o", function() paneru.run("overview") end)
 ```
 
 ---
@@ -68,6 +77,7 @@ paneru.setup {
   bindings = {
     ["window focus east"] = "alt - l",
     ["quit"] = "ctrl + alt - q",
+    ["overview"] = "alt - o",
   },
 }
 ```
@@ -140,7 +150,7 @@ end)
 
 | Event Name | Description | Event Payload Fields |
 | --- | --- | --- |
-| `window_spawned` | A window was fully spawned and initialized in Paneru | `type`, `window_id`, `pid`, `app_name`, `bundle_id`, `title`, `frame` (`{x, y, width, height}`), `floating`, `managed` |
+| `window_spawned` | A window was fully spawned and initialized in Paneru | `type`, `window_id`, `pid`, `app_name`, `bundle_id`, `title`, `role`, `subrole`, `frame` (`{x, y, width, height}`), `floating`, `managed` |
 | `window_focused` | A window gained focus | `type`, `window_id` |
 | `window_destroyed` | A window was closed / destroyed | `type`, `window_id` |
 | `window_moved` | A window was moved | `type`, `window_id` |
@@ -154,7 +164,9 @@ end)
 | `application_hidden` | An application became hidden | `type`, `pid` |
 | `mouse_down` / `mouse_up` / `mouse_dragged` / `mouse_moved` | Mouse actions | `type`, `x`, `y`, `modifiers` |
 | `space_changed` | Active workspace changed | `type` |
-| `space_created` / `space_destroyed` | Virtual workspace added or removed | `type`, `space_id` |
+| `space_current_changed` | Active native Space changed on a display | `type`, `space_id` |
+| `space_membership_changed` | Window-to-Space membership updated | `type` |
+| `space_created` / `space_destroyed` | Native Space added or removed | `type`, `space_id` |
 
 ---
 
@@ -180,9 +192,17 @@ end)
 | `paneru.query_state()` | the complete state document |
 | `paneru.query_active()` | the active display, workspace and focused window |
 | `paneru.query_workspaces()` | the virtual workspace rows |
+| `paneru.query_desktops()` | the native macOS Desktops / Spaces across displays |
 | `paneru.query_on_screen()` | the windows currently visible |
 
-These are spelled exactly as in the loadable client module (`require("paneru")`, see [`crates/lua`](crates/lua)), so a helper that reads state works unchanged in either host. The payloads are documented in [`QUERY_AND_SUBSCRIBE_FORMAT.md`](QUERY_AND_SUBSCRIBE_FORMAT.md).
+These are spelled exactly as in the loadable client module (`require("paneru")`, implemented in [`src/lua/client.rs`](src/lua/client.rs)), so a helper that reads state works unchanged in either host. The payloads are documented in [`QUERY_AND_SUBSCRIBE_FORMAT.md`](QUERY_AND_SUBSCRIBE_FORMAT.md).
+
+To build the standalone loadable `paneru.so` shared library for an external Lua interpreter (e.g. Lua 5.4 or LuaJIT):
+
+```sh
+cargo build --release --lib --no-default-features --features module,lua54
+ln -sf target/release/libpaneru.dylib paneru.so
+```
 
 State is gathered on demand and at most once per callback, so handlers that never query cost nothing extra. Outside a callback there is no window-manager state to read, so calling one of these at script top level raises an error; call them inside a handler or keybinding callback.
 
@@ -253,12 +273,13 @@ A handler that raises partway through changes nothing either, because it never r
 | `ws:columns([n])` | The columns of a workspace, each a list of window IDs |
 | `ws:column_of(id)` / `ws:workspace_of(id)` | The column index / workspace number a window is on |
 | `ws:display_of(id)` | The display a window is on: `{ id, active, x, y, width, height }` |
+| `ws:displays()` | Every display in the same form, also a display with no windows. Pass an `id` to `window displaymove <id>` |
 | `ws:east(id)` / `ws:west(id)` | The window one column over |
 | `ws:next(id)` / `ws:prev(id)` | The next/previous window, wrapping |
 
-A window record contains `id`, `app_name`, `bundle_id`, `title`, `frame`, `floating`, `managed`, `visible` and `focused`.
+A window record contains `id`, `app_name`, `bundle_id`, `title`, `role`, `subrole`, `frame`, `floating`, `managed`, `visible` and `focused`.
 
-`paneru.match{ app = …, bundle = …, title = …, floating = …, managed = … }` builds a compiled predicate; `app`, `bundle` and `title` are regular expressions.
+`paneru.match{ app = …, bundle = …, title = …, role = …, subrole = …, floating = …, managed = … }` builds a compiled predicate; `app`, `bundle` and `title` are regular expressions, while `role` and `subrole` match exact strings.
 
 ### Transforming Layout State
 
@@ -280,6 +301,22 @@ Each method returns a new window set:
 
 ```lua
 ws:float(id, { x = 0.1, y = 0.05, width = 0.8, height = 0.5 })
+```
+
+### Native macOS Desktops (`paneru.desktop`)
+
+Imperative native macOS Space / Desktop operations are exposed under `paneru.desktop` in both `init.lua` and the external `require("paneru")` client module:
+
+```lua
+paneru.desktop.focus("east")                          -- or 2, or { number = 2, display = 1 }, or { space_id = 42 }
+paneru.desktop.move_window({ number = 2, follow = true })
+paneru.desktop.send_window(2)                         -- shorthand for follow = false
+paneru.desktop.create({ focus = true })
+paneru.desktop.destroy({ number = nil, empty_only = false })
+paneru.desktop.reorder("east")                        -- or 3
+paneru.desktop.swap(1)
+paneru.desktop.pin("all")                             -- or 2; paneru.desktop.unpin()
+paneru.desktop.assign("all")                          -- "all" | "this" | "none" | 2 | { number = 2, pid = 1234 }
 ```
 
 ---

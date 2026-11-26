@@ -21,6 +21,7 @@ use self::decorations::{
     BorderRadiusOption, DescriptorStyle, IndicatorFormat, IndicatorStyle, MenubarOrientation,
 };
 use self::swipe::SwipeGestureDirection;
+use crate::tab_indicator::TabIndicatorPosition;
 
 #[cfg(test)]
 use crate::commands::{MoveFocus, Operation, ResizeDirection};
@@ -70,6 +71,12 @@ pub static CONFIGURATION_FILE: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
 });
 
 const DEFAULT_CONFIGURATION: &str = "# Paneru configuration\n\n[options]\n\n[bindings]\n";
+// The documented 0.1–2.0 range predates normalized touch deltas; scale the
+// resolved value once so every swipe consumer sees the same calibration.
+pub(crate) const SWIPE_SENSITIVITY_CALIBRATION: f64 = 5.0;
+// The configured 1–10 range predates the current time-based inertia. Map it
+// to a stronger per-second decay rate while keeping the control linear.
+const SWIPE_DECELERATION_CALIBRATION: f64 = 2.0;
 
 fn default_configuration_file() -> std::io::Result<PathBuf> {
     let config_home = env::var_os("XDG_CONFIG_HOME")
@@ -295,7 +302,7 @@ pub fn deprecated_options_in_file(path: &Path) -> Result<Vec<String>> {
 /// "focus", "east"]`), mapping the shared vocabulary crate's parse error into
 /// this crate's configuration error.
 pub fn parse_command(argv: &[&str]) -> Result<Command> {
-    paneru_shared_types::commands::parse_command(argv)
+    crate::types::commands::parse_command(argv)
         .map_err(|err| Error::InvalidConfig(format!("{}: {err}", function_name!())))
 }
 
@@ -419,19 +426,38 @@ impl Config {
             })
     }
 
-    /// Finds window properties for a given `title` and `bundle_id`.
+    /// Finds window properties for a window.
     /// It iterates through configured window parameters and returns all matching rules.
-    /// A rule matches when its bundle ID (if any) and title regex match.
+    /// A rule matches when its title regex matches and each of its bundle ID, role
+    /// and subrole (if set) equals the window's. A rule's role or subrole never
+    /// matches a window that reports none.
     ///
     /// # Arguments
     ///
     /// * `title` - The title of the window to match.
     /// * `bundle_id` - The bundle identifier of the application owning the window.
+    /// * `role` - The window's accessibility role, if it reports one.
+    /// * `subrole` - The window's accessibility subrole, if it reports one.
     ///
     /// # Returns
     ///
     /// A `Vec<WindowParams>` containing all matching window rules.
-    pub fn find_window_properties(&self, title: &str, bundle_id: &str) -> Vec<WindowParams> {
+    /// Whether any configured `[windows.<rule>]` specifies a `desktop` placement target.
+    #[must_use]
+    pub fn has_desktop_window_rules(&self) -> bool {
+        self.inner()
+            .windows
+            .as_ref()
+            .is_some_and(|windows| windows.values().any(|params| params.desktop.is_some()))
+    }
+
+    pub fn find_window_properties(
+        &self,
+        title: &str,
+        bundle_id: &str,
+        role: Option<&str>,
+        subrole: Option<&str>,
+    ) -> Vec<WindowParams> {
         self.inner()
             .windows
             .as_ref()
@@ -441,7 +467,12 @@ impl Config {
                     .filter(|params| {
                         let bundle_match =
                             params.bundle_id.as_ref().map(|id| id.as_str() == bundle_id);
-                        bundle_match.is_none_or(|m| m) && params.title.is_match(title)
+                        let role_match = params.role.as_deref().map(|r| Some(r) == role);
+                        let subrole_match = params.subrole.as_deref().map(|s| Some(s) == subrole);
+                        bundle_match.is_none_or(|m| m)
+                            && role_match.is_none_or(|m| m)
+                            && subrole_match.is_none_or(|m| m)
+                            && params.title.is_match(title)
                     })
                     .cloned()
                     .collect::<Vec<_>>()
@@ -453,12 +484,7 @@ impl Config {
     /// process be forcibly managed even when macOS reports it as unobservable.
     pub fn should_force_manage_process(&self, process: &dyn ProcessApi) -> bool {
         self.inner().windows.as_ref().is_some_and(|windows| {
-            let Some(bundle_id) = process
-                .application()
-                .as_ref()
-                .and_then(|app| app.bundleIdentifier())
-                .map(|id| id.to_string())
-            else {
+            let Some(bundle_id) = process.bundle_id() else {
                 return false;
             };
             windows.values().any(|params| {
@@ -519,6 +545,87 @@ impl Config {
             .and_then(|swipe| swipe.gesture.as_ref())
             .and_then(|gesture| gesture.fingers_count)
             .or(config.options.swipe_gesture_fingers)
+    }
+
+    pub fn swipe_gesture_paging(&self) -> bool {
+        self.inner()
+            .swipe
+            .as_ref()
+            .and_then(|swipe| swipe.gesture.as_ref())
+            .and_then(|gesture| gesture.paging)
+            .unwrap_or(false)
+    }
+
+    #[cfg(any(feature = "lua", test))]
+    pub fn swipe_gesture_page_distance_cm(&self) -> f64 {
+        self.inner()
+            .swipe
+            .as_ref()
+            .and_then(|swipe| swipe.gesture.as_ref())
+            .and_then(|gesture| gesture.page_distance_cm)
+            .unwrap_or(2.0)
+    }
+
+    pub fn swipe_gesture_haptics(&self) -> bool {
+        self.inner()
+            .swipe
+            .as_ref()
+            .and_then(|swipe| swipe.gesture.as_ref())
+            .and_then(|gesture| gesture.haptics)
+            .unwrap_or(true)
+    }
+
+    pub(crate) fn swipe_paging_config(
+        &self,
+    ) -> (bool, Option<usize>, SwipeGestureDirection, f64, bool) {
+        let config = self.inner();
+        let gesture = config
+            .swipe
+            .as_ref()
+            .and_then(|swipe| swipe.gesture.as_ref());
+        let paging = gesture.and_then(|g| g.paging).unwrap_or(false);
+        let fingers = gesture
+            .and_then(|g| g.fingers_count)
+            .or(config.options.swipe_gesture_fingers);
+        let direction = gesture
+            .and_then(|g| g.direction.clone())
+            .or_else(|| config.options.swipe_gesture_direction.clone())
+            .unwrap_or(SwipeGestureDirection::Natural);
+        let distance_cm = gesture.and_then(|g| g.page_distance_cm).unwrap_or(2.0);
+        let haptics = gesture.and_then(|g| g.haptics).unwrap_or(true);
+        (paging, fingers, direction, distance_cm, haptics)
+    }
+
+    /// Finger count for the overview gesture, if enabled and distinct from
+    /// the window-swipe count.
+    pub fn overview_gesture_fingers(&self) -> Option<usize> {
+        let config = self.inner();
+        config
+            .swipe
+            .as_ref()
+            .and_then(|swipe| swipe.gesture.as_ref())
+            .and_then(|gesture| gesture.overview_fingers)
+            .filter(|fingers| *fingers >= 3 && Some(*fingers) != self.swipe_gesture_fingers())
+    }
+
+    /// Most windows streaming live in the overview at once.
+    pub fn overview_live_previews(&self) -> usize {
+        self.inner()
+            .overview
+            .as_ref()
+            .and_then(|o| o.live_previews)
+            .unwrap_or(4)
+    }
+
+    /// See [`OverviewOptions::live_margin`].
+    pub fn overview_live_margin(&self) -> f64 {
+        self.inner()
+            .overview
+            .as_ref()
+            .and_then(|o| o.live_margin)
+            .filter(|m| m.is_finite())
+            .unwrap_or(0.0)
+            .max(0.0)
     }
 
     pub fn swipe_vertical(&self) -> bool {
@@ -591,14 +698,17 @@ impl Config {
             .unwrap_or(false)
     }
 
-    pub fn border_color(&self) -> (f64, f64, f64) {
+    pub fn border_color(&self, is_dark: bool) -> (f64, f64, f64) {
         let config = self.inner();
-        config
+        let border = config
             .decorations
             .as_ref()
             .and_then(|decorations| decorations.active.as_ref())
-            .and_then(|active| active.border.as_ref())
-            .and_then(|border| border.color.as_deref())
+            .and_then(|active| active.border.as_ref());
+        border
+            .filter(|_| is_dark)
+            .and_then(|border| border.color_night.as_deref())
+            .or(border.and_then(|border| border.color.as_deref()))
             .or(config.options.border_color.as_deref())
             .map_or((1.0, 1.0, 1.0), parse_hex_color)
     }
@@ -650,6 +760,72 @@ impl Config {
         self.options().menubar_height.map(i32::from)
     }
 
+    pub fn tab_indicator_enabled(&self) -> bool {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.tab_indicator.as_ref())
+            .and_then(|tab_indicator| tab_indicator.enabled)
+            .unwrap_or(true)
+    }
+
+    pub fn tab_indicator_position(&self) -> TabIndicatorPosition {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.tab_indicator.as_ref())
+            .and_then(|tab_indicator| tab_indicator.position)
+            .unwrap_or_default()
+    }
+
+    pub fn tab_indicator_width(&self) -> f64 {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.tab_indicator.as_ref())
+            .and_then(|tab_indicator| tab_indicator.width)
+            .unwrap_or(6.0)
+            .max(0.0)
+    }
+
+    pub fn tab_indicator_gap(&self) -> f64 {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.tab_indicator.as_ref())
+            .and_then(|tab_indicator| tab_indicator.gap)
+            .unwrap_or(4.0)
+            .max(0.0)
+    }
+
+    pub fn tab_indicator_segment_gap(&self) -> f64 {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.tab_indicator.as_ref())
+            .and_then(|tab_indicator| tab_indicator.segment_gap)
+            .unwrap_or(2.0)
+            .max(0.0)
+    }
+
+    pub fn tab_indicator_active_color(&self) -> (f64, f64, f64) {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.tab_indicator.as_ref())
+            .and_then(|tab_indicator| tab_indicator.active_color.as_deref())
+            .map_or((0.353, 0.784, 0.980), parse_hex_color)
+    }
+
+    pub fn tab_indicator_inactive_color(&self) -> (f64, f64, f64) {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.tab_indicator.as_ref())
+            .and_then(|tab_indicator| tab_indicator.inactive_color.as_deref())
+            .map_or((0.4, 0.4, 0.4), parse_hex_color)
+    }
+
     pub fn swipe_sensitivity(&self) -> f64 {
         let config = self.inner();
         config
@@ -659,6 +835,7 @@ impl Config {
             .or(config.options.swipe_sensitivity)
             .unwrap_or(0.35)
             .clamp(0.1, 2.0)
+            * SWIPE_SENSITIVITY_CALIBRATION
     }
 
     pub fn continuous_swipe(&self) -> bool {
@@ -681,6 +858,7 @@ impl Config {
             .or(config.options.swipe_deceleration)
             .unwrap_or(4.0)
             .clamp(1.0, 10.0)
+            * SWIPE_DECELERATION_CALIBRATION
     }
 
     pub fn mouse_resize_modifier(&self) -> Option<Modifiers> {
@@ -812,6 +990,18 @@ impl Config {
         self.options().horizontal_mouse_warp_offset.unwrap_or(0)
     }
 
+    pub fn horizontal_mouse_warp_lowest_below(&self) -> bool {
+        self.options()
+            .horizontal_mouse_warp_lowest_below
+            .is_some_and(|below| below)
+    }
+
+    pub fn remember_display_setups(&self) -> bool {
+        self.options()
+            .remember_display_setups
+            .is_some_and(|remember| remember)
+    }
+
     pub fn reap_empty_workspaces(&self) -> bool {
         // Default is disabled..
         self.options()
@@ -869,6 +1059,14 @@ impl Config {
         self.options()
             .create_virtual_workspace_automatically
             .is_some_and(|enabled| enabled)
+    }
+    pub fn menubar_enabled(&self) -> bool {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.menu.as_ref())
+            .and_then(|menubar| menubar.enabled)
+            .is_none_or(|enabled| enabled)
     }
     pub fn menubar_orientation(&self) -> MenubarOrientation {
         self.inner()
@@ -1056,10 +1254,14 @@ impl OneOrMore {
         }
     }
 
-    fn all_mut(&mut self) -> Vec<&mut Keybinding> {
+    fn retain(&mut self, mut keep: impl FnMut(&mut Keybinding) -> bool) {
         match self {
-            OneOrMore::Single(one) => vec![one],
-            OneOrMore::Multiple(many) => many.iter_mut().collect::<Vec<_>>(),
+            OneOrMore::Single(one) => {
+                if !keep(one) {
+                    *self = OneOrMore::Multiple(Vec::new());
+                }
+            }
+            OneOrMore::Multiple(many) => many.retain_mut(keep),
         }
     }
 }
@@ -1079,6 +1281,20 @@ struct InnerConfig {
     swipe: Option<swipe::SwipeOptions>,
     padding: Option<padding::PaddingOptions>,
     restore: Option<RestoreOptions>,
+    overview: Option<OverviewOptions>,
+}
+
+/// `[overview]`: the niri-style overview.
+#[derive(Deserialize, Debug, Default, Clone)]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct OverviewOptions {
+    /// How many windows show live (streamed) previews at once; the others
+    /// show snapshots. 0 turns live previews off. Default: 4.
+    pub live_previews: Option<usize>,
+    /// How far past the screen edge (as a fraction of the display height)
+    /// a card keeps streaming, so cards scrolled just out of view don't
+    /// stop and restart. Default: 0.
+    pub live_margin: Option<f64>,
 }
 
 impl InnerConfig {
@@ -1111,7 +1327,7 @@ impl InnerConfig {
             return Ok(config);
         }
 
-        let virtual_keys = generate_virtual_keymap();
+        let virtual_keys = keymap_for_config_parsing();
         Self::parse_config_with_virtual_keys(input, &virtual_keys)
     }
 
@@ -1123,16 +1339,21 @@ impl InnerConfig {
 
         for (command, bindings) in &mut config.bindings {
             let argv = command.split('_').collect::<Vec<_>>();
-            for binding in bindings.all_mut() {
-                binding.command = parse_command(&argv)?;
-
+            let parsed = parse_command(&argv)?;
+            let fn_name = function_name!();
+            // An unresolved binding keeps the deserialized code 0, which is
+            // the A key, so it must go.
+            bindings.retain(|binding| {
                 if let Some(code) = keycode_for_key_name(&binding.key, virtual_keys) {
                     binding.code = code;
+                    binding.command = parsed.clone();
                     info!("bind: {binding:?}");
+                    true
                 } else {
-                    error!("{}: invalid key '{}'", function_name!(), &binding.key);
+                    error!("{fn_name}: invalid key '{}'", &binding.key);
+                    false
                 }
-            }
+            });
         }
 
         // Resolve passthrough keybinding strings into (keycode, modifiers) pairs.
@@ -1192,6 +1413,8 @@ pub struct MainOptions {
     /// higher or lower than the laptop). When warping downward (target below
     /// source) the offset is added; when warping upward, subtracted.
     pub horizontal_mouse_warp_offset: Option<i32>,
+    /// Puts the lowest display below the warp row instead of in it.
+    pub horizontal_mouse_warp_lowest_below: Option<bool>,
     /// A list of preset column widths (as ratios) used for resizing windows.
     #[serde(default = "default_preset_column_widths")]
     pub preset_column_widths: Vec<f64>,
@@ -1256,6 +1479,10 @@ pub struct MainOptions {
     /// If enabled, an empty virtual workspace will be removed.
     /// Default: true.
     pub reap_empty_workspaces: Option<bool>,
+
+    /// Remembers the layout of each display setup and restores it when that setup returns.
+    /// Default: false.
+    pub remember_display_setups: Option<bool>,
 
     /// Disable detection of native macOS tabs. When set, newly-spawned windows are
     /// never auto-merged into a tab group with an existing same-app sibling.
@@ -1336,6 +1563,165 @@ impl<'de> Deserialize<'de> for Keybinding {
     }
 }
 
+/// The initial width of a managed window, either fixed or based on the focused window.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum InitialWindowWidth {
+    Ratio(f64),
+    Mode(InitialWindowWidthMode),
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InitialWindowWidthMode {
+    ComplementFocused,
+}
+
+impl InitialWindowWidth {
+    pub fn ratio(self, focused_ratio: Option<f64>) -> f64 {
+        match self {
+            Self::Ratio(ratio) => ratio,
+            Self::Mode(InitialWindowWidthMode::ComplementFocused) => {
+                // The first window, or one opened from an almost full-width
+                // window, should occupy the display rather than a tiny sliver.
+                let Some(ratio) = focused_ratio.filter(|ratio| ratio.is_finite() && *ratio > 0.0)
+                else {
+                    return 1.0;
+                };
+                if ratio >= 0.95 { 1.0 } else { 1.0 - ratio }
+            }
+        }
+    }
+}
+
+#[test]
+#[allow(clippy::float_cmp)]
+fn test_initial_window_width_config() {
+    let config = Config::try_from(
+        r#"
+[windows.dynamic]
+title = ".*"
+width = "complement_focused"
+"#,
+    )
+    .expect("dynamic width rule parses");
+    let width = config.find_window_properties("Window 1", "", None, None)[0]
+        .width
+        .expect("matched width rule");
+    assert_eq!(width.ratio(Some(0.25)), 0.75);
+    assert_eq!(width.ratio(Some(0.5)), 0.5);
+    assert_eq!(width.ratio(Some(0.95)), 1.0);
+    assert_eq!(width.ratio(Some(1.0)), 1.0);
+    assert_eq!(width.ratio(None), 1.0);
+
+    let config = Config::try_from(
+        r#"
+[windows.fixed]
+title = ".*"
+width = 0.5
+"#,
+    )
+    .expect("fixed width rule still parses");
+    let width = config.find_window_properties("Window 1", "", None, None)[0]
+        .width
+        .expect("matched width rule");
+    assert_eq!(width.ratio(Some(0.25)), 0.5);
+}
+
+#[test]
+fn test_window_desktop_rule_config() {
+    let config = Config::try_from(
+        r#"
+[windows.slack]
+title = "Slack"
+desktop = 2
+
+[windows.pip]
+title = "PiP"
+desktop = "all"
+"#,
+    )
+    .expect("desktop window rules parse");
+
+    let slack = config.find_window_properties("Slack", "", None, None);
+    assert_eq!(
+        slack[0].desktop,
+        Some(DesktopRuleTarget::Number(
+            std::num::NonZeroU32::new(2).unwrap()
+        ))
+    );
+    let pip = config.find_window_properties("PiP", "", None, None);
+    assert_eq!(pip[0].desktop, Some(DesktopRuleTarget::All));
+
+    assert!(
+        Config::try_from("[windows.bad]\ntitle = \".*\"\ndesktop = 0\n").is_err(),
+        "desktop = 0 must be rejected"
+    );
+    assert!(
+        Config::try_from("[windows.bad]\ntitle = \".*\"\ndesktop = \"current\"\n").is_err(),
+        "unknown desktop string must be rejected"
+    );
+}
+
+/// Target Desktop placement in a `[windows.<rule>]` entry (`desktop = 2` or `desktop = "all"`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DesktopRuleTarget {
+    Number(std::num::NonZeroU32),
+    All,
+}
+
+impl<'de> Deserialize<'de> for DesktopRuleTarget {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct DesktopRuleVisitor;
+
+        impl de::Visitor<'_> for DesktopRuleVisitor {
+            type Value = DesktopRuleTarget;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a 1-based desktop integer (>= 1) or \"all\"")
+            }
+
+            fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<Self::Value, E> {
+                u32::try_from(v)
+                    .ok()
+                    .and_then(std::num::NonZeroU32::new)
+                    .map(DesktopRuleTarget::Number)
+                    .ok_or_else(|| E::custom("desktop number must be >= 1"))
+            }
+
+            fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<Self::Value, E> {
+                u64::try_from(v)
+                    .ok()
+                    .ok_or_else(|| E::custom("desktop number must be >= 1"))
+                    .and_then(|u| self.visit_u64(u))
+            }
+
+            fn visit_f64<E: de::Error>(self, v: f64) -> std::result::Result<Self::Value, E> {
+                if v.is_finite() && v >= 1.0 && v.fract() == 0.0 && v <= f64::from(u32::MAX) {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    self.visit_u64(v as u64)
+                } else {
+                    Err(E::custom("desktop number must be an integer >= 1"))
+                }
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
+                match v {
+                    "all" => Ok(DesktopRuleTarget::All),
+                    _ => Err(E::custom(format!(
+                        "invalid desktop rule {v:?}: expected >= 1 or \"all\""
+                    ))),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(DesktopRuleVisitor)
+    }
+}
+
 /// `WindowParams` defines rules and properties for specific windows based on their title or bundle ID.
 /// These parameters can override default window management behavior, such as forcing a window to float or setting its initial index.
 #[derive(Clone, Debug, Deserialize)]
@@ -1345,6 +1731,11 @@ pub struct WindowParams {
     title: Regex,
     /// An optional bundle identifier to match against the application's bundle ID.
     bundle_id: Option<String>,
+    /// An optional accessibility role (e.g. `AXWindow`) the window must report exactly.
+    role: Option<String>,
+    /// An optional accessibility subrole (e.g. `AXStandardWindow`, `AXDialog`) the
+    /// window must report exactly.
+    subrole: Option<String>,
     /// If `true`, the window will be managed as a floating window (not tiled).
     pub floating: Option<bool>,
     /// If `true`, force the process/window to be managed even if macOS reports it as
@@ -1352,13 +1743,16 @@ pub struct WindowParams {
     pub manage: Option<bool>,
     /// An optional preferred index for the window's position in the window strip.
     pub index: Option<usize>,
+    /// Native macOS Desktop placement when the window spawns (`2` or `"all"`).
+    pub desktop: Option<DesktopRuleTarget>,
     pub vertical_padding: Option<i32>,
     pub horizontal_padding: Option<i32>,
     pub dont_focus: Option<bool>,
-    /// An optional positive initial width ratio relative to the display width.
-    /// Values above 1.0 create an oversized, horizontally scrollable window.
+    /// A positive initial width ratio relative to the display width, or
+    /// `"complement_focused"` to fill the width left by the focused window.
+    /// Fixed ratios above 1.0 create an oversized, horizontally scrollable window.
     /// Overrides the default column width when the window is first managed.
-    pub width: Option<f64>,
+    pub width: Option<InitialWindowWidth>,
     /// Grid placement for floating windows: "cols:rows:x:y:w:h".
     /// Divides the display into a grid and positions the window at the given cell/span.
     pub grid: Option<String>,
@@ -1380,9 +1774,12 @@ impl WindowParams {
         Self {
             title: Regex::new(title).unwrap(),
             bundle_id,
+            role: None,
+            subrole: None,
             floating: None,
             manage: None,
             index: None,
+            desktop: None,
             vertical_padding: None,
             horizontal_padding: None,
             dont_focus: None,
@@ -1560,7 +1957,17 @@ pub(crate) fn prime_virtual_keymap() {
 /// happened (harmless in unit tests, rare elsewhere).
 #[cfg(feature = "lua")]
 fn virtual_keymap() -> &'static [(String, u8)] {
-    VIRTUAL_KEYMAP.get_or_init(generate_virtual_keymap)
+    VIRTUAL_KEYMAP.get_or_init(keymap_for_config_parsing)
+}
+
+#[cfg(not(test))]
+fn keymap_for_config_parsing() -> Vec<(String, u8)> {
+    generate_virtual_keymap()
+}
+
+#[cfg(test)]
+fn keymap_for_config_parsing() -> Vec<(String, u8)> {
+    test_virtual_keymap()
 }
 
 /// Resolves a keybinding string like `"ctrl+alt-h"` into a `(keycode, Modifiers)` pair.
@@ -1877,6 +2284,12 @@ enum UCKeyAction {
 ///
 /// A `Vec<(String, u8)>` containing the translated key names and their keycodes. Returns an empty vector if an error occurs during keyboard layout fetching.
 fn generate_virtual_keymap() -> Vec<(String, u8)> {
+    // HIToolbox aborts the process when two threads call TIS at once, as
+    // parallel tests do.
+    static TIS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = TIS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let keyboard = AXUIWrapper::from_retained(unsafe {
         TISCopyCurrentASCIICapableKeyboardLayoutInputSource()
     })
@@ -1928,6 +2341,22 @@ fn generate_virtual_keymap() -> Vec<(String, u8)> {
         })
         .flatten()
         .collect()
+}
+
+#[test]
+fn test_keymaps_built_on_several_threads_at_once_do_not_abort() {
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            std::thread::spawn(|| {
+                for _ in 0..5 {
+                    generate_virtual_keymap();
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().expect("building a keymap");
+    }
 }
 
 #[cfg(test)]
@@ -2055,7 +2484,8 @@ index = 1
         Some(Command::Window(Operation::Resize(ResizeDirection::Shrink)))
     ));
 
-    let props = config.find_window_properties("picture in picture", "com.something.apple");
+    let props =
+        config.find_window_properties("picture in picture", "com.something.apple", None, None);
     assert_eq!(props[0].floating, Some(true));
     assert_eq!(props[0].index, Some(1));
 
@@ -2066,8 +2496,12 @@ index = 1
     ));
 
     let defaults = Config::default();
-    assert_eq!(defaults.swipe_sensitivity(), 0.35);
-    assert_eq!(defaults.swipe_deceleration(), 4.0);
+    assert_eq!(defaults.swipe_sensitivity(), 1.75);
+    assert_eq!(defaults.swipe_deceleration(), 8.0);
+
+    let fastest = Config::try_from("[swipe]\nsensitivity = 2.0\ndeceleration = 10.0\n").unwrap();
+    assert_eq!(fastest.swipe_sensitivity(), 10.0);
+    assert_eq!(fastest.swipe_deceleration(), 20.0);
 }
 
 #[test]
@@ -2102,6 +2536,18 @@ window_virtualsendnum_3 = "cmd + alt + shift - 3"
             2,
             MoveFocus::Stay
         )))
+    ));
+}
+
+#[test]
+fn test_overview_binding() {
+    let config = Config::try_from("[bindings]\noverview = \"alt - o\"\n").expect("parses");
+    let keycode = virtual_keycode()
+        .find_map(|(s, v)| (*s == "o").then_some(*v))
+        .unwrap();
+    assert!(matches!(
+        config.find_keybind(keycode, Modifiers::ALT),
+        Some(Command::Overview)
     ));
 }
 
@@ -2209,9 +2655,12 @@ fn test_grid_ratios() {
     let make = |grid: Option<&str>| WindowParams {
         title: Regex::new(".*").unwrap(),
         bundle_id: None,
+        role: None,
+        subrole: None,
         floating: None,
         manage: None,
         index: None,
+        desktop: None,
         vertical_padding: None,
         horizontal_padding: None,
         dont_focus: None,
@@ -2294,17 +2743,83 @@ fn test_parse_hex_color_malformed_hex() {
 }
 
 #[test]
+fn test_border_color_night_fallback() {
+    const RED: (f64, f64, f64) = (1.0, 0.0, 0.0);
+    const GREEN: (f64, f64, f64) = (0.0, 1.0, 0.0);
+    const BLUE: (f64, f64, f64) = (0.0, 0.0, 1.0);
+    const WHITE: (f64, f64, f64) = (1.0, 1.0, 1.0);
+    let cases = [
+        ("color = '#FF0000'\ncolor_night = '#00FF00'", "", RED, GREEN),
+        ("color = '#FF0000'", "border_color = '#0000FF'", RED, RED),
+        (
+            "color_night = '#00FF00'",
+            "border_color = '#0000FF'",
+            BLUE,
+            GREEN,
+        ),
+        ("color_night = '#00FF00'", "", WHITE, GREEN),
+        ("", "border_color = '#0000FF'", BLUE, BLUE),
+        ("", "", WHITE, WHITE),
+    ];
+    for (border, legacy, light, dark) in cases {
+        let config = Config::try_from(&*format!(
+            "[options]\n{legacy}\n[bindings]\n[decorations.active.border]\n{border}"
+        ))
+        .unwrap();
+        assert_eq!(
+            config.border_color(false),
+            light,
+            "light: {border} {legacy}"
+        );
+        assert_eq!(config.border_color(true), dark, "dark: {border} {legacy}");
+    }
+}
+
+#[test]
 #[allow(clippy::float_cmp)]
 fn test_config_defaults() {
     let config = Config::default();
     assert_eq!(config.dim_inactive_opacity(), 0.0);
     assert_eq!(config.dim_inactive_color(), (0.0, 0.0, 0.0));
     assert!(!config.border_active_window());
-    assert_eq!(config.border_color(), (1.0, 1.0, 1.0));
+    assert_eq!(config.border_color(false), (1.0, 1.0, 1.0));
+    assert_eq!(config.border_color(true), (1.0, 1.0, 1.0));
     assert_eq!(config.border_opacity(), 1.0);
     assert_eq!(config.border_width(), 2.0);
-    assert_eq!(config.border_radius(), BorderRadiusOption::Auto);
+    // Automatic radius detection is only enabled on macOS 26; other
+    // releases use the fixed-radius fallback.
+    let expected_radius = if macos_major_version() == 26 {
+        BorderRadiusOption::Auto
+    } else {
+        BorderRadiusOption::Value(10.0)
+    };
+    assert_eq!(config.border_radius(), expected_radius);
     assert_eq!(config.menubar_height(), None);
+    assert!(config.menubar_enabled());
+}
+
+#[test]
+fn test_menubar_enabled_is_independent_of_workspace_indicator() {
+    for menu_options in [
+        "",
+        "[decorations.menu]\n",
+        "[decorations.menu]\nenabled = true",
+    ] {
+        let config = Config::try_from(
+            format!(
+                "[options]\n[bindings]\n[decorations]\nworkspace_menu_status = false\n{menu_options}"
+            )
+            .as_str(),
+        )
+        .expect("config should parse");
+        assert!(config.menubar_enabled());
+        assert!(!config.workspace_menu_status());
+    }
+
+    let config = Config::try_from("[options]\n[bindings]\n[decorations.menu]\nenabled = false")
+        .expect("config should parse");
+    assert!(!config.menubar_enabled());
+    assert!(config.workspace_menu_status());
 }
 
 #[test]
@@ -2362,14 +2877,137 @@ floating = true
     let config = Config::try_from(input).expect("config should parse");
 
     // Main window should match the manage rule.
-    let props = config.find_window_properties("BetterTouchTool", "com.hegenberg.BetterTouchTool");
+    let props = config.find_window_properties(
+        "BetterTouchTool",
+        "com.hegenberg.BetterTouchTool",
+        None,
+        None,
+    );
     assert_eq!(props.len(), 1);
     assert_eq!(props[0].manage, Some(true));
 
     // Screenshot window matches the floating rule.
-    let props = config.find_window_properties("Screenshot 1", "com.hegenberg.BetterTouchTool");
+    let props =
+        config.find_window_properties("Screenshot 1", "com.hegenberg.BetterTouchTool", None, None);
     assert_eq!(props.len(), 1);
     assert_eq!(props[0].floating, Some(true));
+}
+
+#[test]
+fn test_window_rules_match_role_and_subrole() {
+    let input = r#"
+[options]
+
+[bindings]
+
+[windows.dialogs]
+title = ".*"
+subrole = "AXDialog"
+floating = true
+
+[windows.sheets]
+title = ".*"
+role = "AXSheet"
+index = 3
+
+[windows.app_standard]
+bundle_id = "com.example.app"
+title = ".*"
+role = "AXWindow"
+subrole = "AXStandardWindow"
+width = 0.5
+
+[windows.plain]
+bundle_id = "com.example.plain"
+title = ".*"
+dont_focus = true
+"#;
+    let config = Config::try_from(input).expect("config should parse");
+    let matched = |title, bundle_id, role, subrole| {
+        let mut names = config
+            .find_window_properties(title, bundle_id, role, subrole)
+            .iter()
+            .map(|params| {
+                if params.floating == Some(true) {
+                    "dialogs"
+                } else if params.index == Some(3) {
+                    "sheets"
+                } else if matches!(params.width, Some(InitialWindowWidth::Ratio(0.5))) {
+                    "app_standard"
+                } else {
+                    "plain"
+                }
+            })
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names
+    };
+
+    // A subrole-only rule matches any app's dialog, and nothing else.
+    assert_eq!(
+        matched("Save", "com.other", Some("AXWindow"), Some("AXDialog")),
+        vec!["dialogs"]
+    );
+    assert_eq!(
+        matched(
+            "Main",
+            "com.other",
+            Some("AXWindow"),
+            Some("AXStandardWindow")
+        ),
+        Vec::<&str>::new()
+    );
+    // A rule's subrole never matches a window that reports none.
+    assert_eq!(
+        matched("Save", "com.other", Some("AXWindow"), None),
+        Vec::<&str>::new()
+    );
+
+    // A role-only rule: the role must match.
+    assert_eq!(
+        matched("Sheet", "com.other", Some("AXSheet"), None),
+        vec!["sheets"]
+    );
+    assert_eq!(
+        matched("Sheet", "com.other", None, None),
+        Vec::<&str>::new()
+    );
+
+    // Role and subrole together: both must match, alongside bundle_id.
+    assert_eq!(
+        matched(
+            "Main",
+            "com.example.app",
+            Some("AXWindow"),
+            Some("AXStandardWindow")
+        ),
+        vec!["app_standard"]
+    );
+    assert_eq!(
+        matched(
+            "Save",
+            "com.example.app",
+            Some("AXWindow"),
+            Some("AXDialog")
+        ),
+        vec!["dialogs"],
+        "app_standard's subrole excludes the app's dialog"
+    );
+
+    // A rule without role/subrole matches as before, whatever the window reports.
+    assert_eq!(
+        matched("Main", "com.example.plain", None, None),
+        vec!["plain"]
+    );
+    assert_eq!(
+        matched(
+            "Save",
+            "com.example.plain",
+            Some("AXWindow"),
+            Some("AXDialog")
+        ),
+        vec!["dialogs", "plain"]
+    );
 }
 
 #[test]
@@ -2446,6 +3084,48 @@ window_grow = "alt - minus"
     ));
 }
 
+#[test]
+fn test_unknown_key_name_does_not_bind_the_a_key() {
+    let input = r#"
+[bindings]
+window_focus_west = ["ctrl+alt-lefarrow", "ctrl+alt-h"]
+window_focus_east = "ctrl+alt-rigtharrow"
+"#;
+    let virtual_keys = test_virtual_keymap();
+    let config = Config {
+        inner: Arc::new(ArcSwap::from_pointee(
+            InnerConfig::parse_config_with_virtual_keys(input, &virtual_keys)
+                .expect("an unknown key name must not reject the whole file"),
+        )),
+    };
+    let keycode = |name: &str| keycode_for_key_name(name, &virtual_keys).unwrap();
+    let chord = Modifiers::CTRL | Modifiers::ALT;
+
+    assert_eq!(keycode("a"), 0);
+    assert_eq!(
+        config.find_keybind(keycode("a"), chord),
+        None,
+        "a mistyped key name must not bind the A key"
+    );
+    assert_eq!(
+        config.find_keybind(keycode("h"), chord),
+        Some(Command::Window(Operation::Focus(
+            crate::commands::Direction::West
+        ))),
+        "the valid chords of the same command must still bind"
+    );
+}
+
+#[test]
+fn test_unknown_command_with_no_keys_is_rejected() {
+    let virtual_keys = test_virtual_keymap();
+    assert!(
+        InnerConfig::parse_config_with_virtual_keys("[bindings]\nbogus_cmd = []\n", &virtual_keys)
+            .is_err(),
+        "an unknown command name must be rejected even with no keys"
+    );
+}
+
 #[cfg(all(test, feature = "lua"))]
 mod lua_setup_tests {
     use super::*;
@@ -2496,7 +3176,7 @@ mod lua_setup_tests {
                 windows = { term = { title = "kitty", bindings_passthrough = { "ctrl+alt-h" } } },
             }"#,
         );
-        let rules = config.find_window_properties("kitty", "");
+        let rules = config.find_window_properties("kitty", "", None, None);
         assert_eq!(rules.len(), 1);
         assert!(
             !rules[0].passthrough_keys().is_empty(),
@@ -2505,8 +3185,86 @@ mod lua_setup_tests {
     }
 
     #[test]
+    fn window_rule_role_and_subrole_are_matched() {
+        let config = config_from_source(
+            r#"return {
+                windows = {
+                    dialogs = { title = ".*", subrole = "AXDialog", floating = true },
+                    sheets = { title = ".*", role = "AXSheet", index = 2 },
+                },
+            }"#,
+        );
+
+        let rules = config.find_window_properties("Save", "", Some("AXWindow"), Some("AXDialog"));
+        assert_eq!(rules.len(), 1, "only the subrole rule matches a dialog");
+        assert_eq!(rules[0].floating, Some(true));
+
+        let rules = config.find_window_properties("Sheet", "", Some("AXSheet"), None);
+        assert_eq!(rules.len(), 1, "only the role rule matches a sheet");
+        assert_eq!(rules[0].index, Some(2));
+
+        assert!(
+            config
+                .find_window_properties("Main", "", Some("AXWindow"), Some("AXStandardWindow"))
+                .is_empty(),
+            "neither rule matches a standard window"
+        );
+    }
+
+    #[test]
     fn non_table_argument_is_rejected() {
         let lua = Lua::new();
         assert!(config_from_lua(&lua, mlua::Value::Integer(3)).is_err());
     }
+}
+
+#[test]
+fn gesture_paging_defaults_and_overrides_are_resolved() {
+    let defaults = Config::default();
+    assert!(!defaults.swipe_gesture_paging());
+    assert_eq!(defaults.swipe_gesture_page_distance_cm(), 2.0);
+    assert!(defaults.swipe_gesture_haptics());
+
+    let enabled = Config::try_from(
+        "[swipe.gesture]\npaging = true\npage_distance_cm = 3.5\nhaptics = false\n",
+    )
+    .unwrap();
+    assert!(enabled.swipe_gesture_paging());
+    assert_eq!(enabled.swipe_gesture_page_distance_cm(), 3.5);
+    assert!(!enabled.swipe_gesture_haptics());
+
+    let disabled = Config::try_from("[swipe.gesture]\npaging = false\nhaptics = true\n").unwrap();
+    assert!(!disabled.swipe_gesture_paging());
+    assert!(disabled.swipe_gesture_haptics());
+}
+
+#[test]
+fn gesture_page_distance_rejects_nonpositive_and_nonfinite_values() {
+    for value in ["0", "-1", "nan", "inf", "-inf"] {
+        let source = format!("[swipe.gesture]\npage_distance_cm = {value}\n");
+        assert!(
+            Config::try_from(source.as_str()).is_err(),
+            "accepted {value}"
+        );
+    }
+}
+
+#[test]
+#[allow(clippy::float_cmp)]
+fn test_overview_live_preview_config() {
+    let defaults = Config::try_from("").expect("empty config parses");
+    assert_eq!(defaults.overview_live_previews(), 4);
+    assert_eq!(defaults.overview_live_margin(), 0.0);
+    let config = Config::try_from(
+        r"
+[overview]
+live_previews = 7
+live_margin = 0.5
+",
+    )
+    .expect("overview section parses");
+    assert_eq!(config.overview_live_previews(), 7);
+    assert_eq!(config.overview_live_margin(), 0.5);
+    let negative = Config::try_from("[overview]\nlive_margin = -1.0\n").expect("parses");
+    assert_eq!(negative.overview_live_margin(), 0.0);
 }

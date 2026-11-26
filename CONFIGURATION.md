@@ -24,8 +24,9 @@ General behavior settings for the window manager.
 | :--- | :--- | :--- | :--- |
 | `focus_follows_mouse` | Boolean | `true` | If enabled, the window under the mouse cursor will automatically gain focus. |
 | `mouse_follows_focus` | Boolean | `true` | If enabled, the mouse cursor will warp to the center of the focused window when focus changes via keyboard. |
-| `horizontal_mouse_warp` | Integer ``(-1, 1)`` | Off | If enabled, the mouse will warp to another screen above or below, when touching the left or right edge. The direction depends on the direction - a negative value will cause the left edge to warp to a screen above and the right edge to a screen below. This allows having horizontal positioning of displays while having them aligned in a virtual layout in macOS settings. The cursor lands at the *opposite* edge of the target display (preserving cursor flow), with the source's relative Y position. Carries pre-warp horizontal velocity to avoid a "standing start", and skips the warp when the equivalent Y has no position on the target — matching macOS's native side-by-side behavior for displays of unequal height. (inspired by https://github.com/mogenson/WarpMouse.spoon) |
+| `horizontal_mouse_warp` | Integer ``(-1, 1)`` | Off | If enabled, the mouse will warp to another screen above or below, when touching the left or right edge. The direction depends on the direction - a negative value will cause the left edge to warp to a screen above and the right edge to a screen below. This allows having horizontal positioning of displays while having them aligned in a virtual layout in macOS settings. The cursor lands at the *opposite* edge of the target display (preserving cursor flow), with the source's relative Y position. Carries pre-warp horizontal velocity to avoid a "standing start", and skips the warp when the equivalent Y has no position on the target — matching macOS's native side-by-side behavior for displays of unequal height. The warp also applies while a mouse button is held, so a dragged window crosses to the target display. (inspired by https://github.com/mogenson/WarpMouse.spoon) |
 | `horizontal_mouse_warp_offset` | Integer (px) | `0` | Vertical pixel offset applied to the `horizontal_mouse_warp` landing position, signed by warp direction. Positive values shift the cursor lower when warping to a display *below* (in macOS arrangement) and higher when warping to one *above*. Use to compensate for physical desk arrangement differing from the macOS arrangement (e.g. portrait monitor sitting physically higher or lower than the laptop). |
+| `horizontal_mouse_warp_lowest_below` | Boolean | `false` | With `horizontal_mouse_warp` and three or more displays, the lowest display (for example a laptop under a row of monitors) is not part of the warp row. Moving down out of any row display reaches it at the matching position, and moving up from it reaches the row display above that position. The row starts at the display directly above the lowest one, at its macOS position, so place the lowest display in macOS under the part of the row it sits under. Its left and right edges do not warp. The pointer never moves up or down between two row displays, because they sit side by side: past the lowest display it stops at the edge. |
 | `preset_column_widths` | Array (Float) | `[0.25, 0.33, 0.5, 0.66, 0.75, 1.0, 1.5, 2.0]` | Ratios of the screen width used by the `window_resize` command and the menu bar width picker. Values above `1.0` create a horizontally scrollable oversized window. |
 | `preset_stack_heights` | Array (Float) | `[0.25, 0.33, 0.5, 0.66, 0.75]` | Ratios of the viewport height used by the `window_vertical_resize` command. Only applies to windows inside a stack; every window in the column is kept at least 200px tall, so a ratio that would starve a neighbour is clamped. |
 | `animation_speed` | Float | *None* | Speed of window animations. Comfortable range is from 8 to 20. Unset or set to a very high value to effectively disable animations. |
@@ -36,6 +37,7 @@ General behavior settings for the window manager.
 | `window_hidden_ratio` | Float (0.0–1.0) | `0.0` | How much of a window can be hidden before it's forced into view on focus change. `0.0` = eager, `1.0` = lazy. |
 | `window_resize_cycle` | Boolean | `true` | If disabled, `window_resize` and `window_shrink` (and their `window_vertical_*` counterparts) stop at the largest/smallest preset instead of cycling back. |
 | `mouse_resize_modifier` | String | *None* | If enabled allows window resizing using mouse movement. For example `cmd + shift` will allow resizing of the window when holding those keys. Proximity of the pointer to left or right window edge determines which side will be adjusted. |
+| `remember_display_setups` | Boolean | `false` | Remembers the layout of each display setup (the set of connected displays), and restores it when that setup returns: which display each window is on, the order of its columns, stacks and tabs, its virtual workspace and its width. A saved space maps to the space at the same position on the same display. |
 | `reap_empty_workspaces` | String | `false` | If enabled, a virtual workspace without any windows will be removed. |
 | `disable_native_tabs` | Boolean | `false` | If enabled, Paneru will not auto-merge a window into a tab group with an existing same-app sibling that shares its frame. Merging happens when the window is created, and again for a background tab that the window server stops showing while a sibling of the same app holds the same frame — an app that hides its old tab a moment late would otherwise leave a column nothing can appear in. Use this if you find unrelated windows being grouped together. |
 | `virtual_workspace_animations` | Boolean | `false` | If enabled, Paneru will animate virtual workspace swaps. Off by default, because people use virtual workspaces due to the slow animation of the native macOS workspaces. |
@@ -73,8 +75,49 @@ Configure trackpad gestures and scroll-wheel window sliding.
 | `fingers_count` | Integer | *None* | Number of fingers for the swipe gesture. Set to 3 or more to enable. |
 | `direction` | String | `"Natural"` | Direction of movement: `"Natural"` or `"Reversed"`. |
 | `vertical` | Boolean | `true` | Interpret the vertical gestures with `fingers_count` or ignore them. Enabling this allows using vertical swipe gestures to change virtual desktops. |
+| `paging` | Boolean | `false` | Focus one adjacent window for each horizontal gesture threshold instead of sliding the strip freely. |
+| `page_distance_cm` | Positive float | `2.0` | Approximate horizontal finger travel in centimeters required for each page when `paging = true`. |
+| `haptics` | Boolean | `true` | Emit a haptic pulse after each confirmed paging focus change. Set to `false` to disable pulses. |
+| `overview_fingers` | Integer | *None* | Number of fingers for the overview gesture: swipe up to open it, down to close. Must be 3 or more and differ from `fingers_count`; unset disables the gesture (the `overview` command and keybinding still work). |
 
 When `fingers_count` is omitted or set below 3, Paneru does not intercept native macOS gestures. If macOS uses three-finger horizontal swipes for Spaces, prefer `[swipe.scroll]` with a modifier or configure a different finger count.
+
+macOS uses four-finger vertical swipes for Mission Control and App Exposé by default. To use `overview_fingers = 4`, turn those off in System Settings → Trackpad → More Gestures, otherwise macOS takes the gesture first.
+
+```toml
+[swipe.gesture]
+fingers_count = 3
+overview_fingers = 4
+```
+
+### Overview live previews
+
+While the overview is open, windows whose cards are on screen show live, streamed content (ScreenCaptureKit); the rest show snapshots. Streams start and stop as cards scroll in and out of view, and all of them stop when the overview closes. macOS shows its screen-recording indicator while they run.
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `live_previews` | Integer | `4` | Most windows streaming at once, the focused window and its neighbours first. `0` turns live previews off (snapshots only, no ScreenCaptureKit, no recording indicator). |
+| `live_margin` | Float | `0.0` | Keep streaming cards this far past the screen edge, as a fraction of the display height, so cards scrolled just out of view don't stop and restart. |
+
+```toml
+[overview]
+live_previews = 4
+live_margin = 0.0
+```
+
+Paging estimates physical distance from the trackpad's reported device size. The centimeter threshold may feel slightly different across devices; adjust `page_distance_cm` to suit your trackpad. Haptics require compatible hardware and may be suppressed by macOS when fingers are no longer touching it.
+
+To move one window at a time with the existing focus animation:
+
+```toml
+[swipe.gesture]
+fingers_count = 3
+paging = true
+page_distance_cm = 2.0
+haptics = true
+```
+
+Each additional 2 cm of horizontal finger travel selects another window. Haptics are on by default in paging mode; set `haptics = false` to disable the pulses while keeping the same paging behavior.
 
 ### `[swipe.scroll]`
 | Option | Type | Default | Description |
@@ -103,8 +146,7 @@ Visual styling for workspaces, active and inactive windows.
 
 ### Virtual Workspace indicators
 
-Toggles display of the currently active virtual workspace in the menubar or in a brief status popup window. Both are enabled by default.
-(Note: disabling menubar indicator requires a restart)
+Toggles display of the currently active virtual workspace in the menubar or in a brief status popup window. Both are enabled by default. `workspace_menu_status` controls only the workspace indicator; the descriptor and menu remain available.
 
 **Example:**
 ```toml
@@ -120,9 +162,35 @@ Basic settings for the menubar display.
 
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
+| `enabled` | Boolean | `true` | Show the Paneru menu bar item unless a saved menu/command choice overrides it. Set to `false` to hide the entire item, including its descriptor, workspace indicator, and menu, freeing its menu bar space. Changes apply without restarting. |
 | `orientation` | String | `'default'` | Which of the menubar elements appears first, the descriptor `'default'` or the indicator `'flipped'`. |
 | `colors` | [String] | `['#FFFFFF']` | An array of hex colors defining a linear gradient (left to right) coloring the menubar display. Set a solid color by including only one element. |
 | `angle` | Float | `90.0` | The angle (in degrees) of the gradient. |
+
+To hide Paneru from the menu bar:
+
+```toml
+[decorations.menu]
+enabled = false
+```
+
+Or in `init.lua`:
+
+```lua
+paneru.setup {
+  decorations = { menu = { enabled = false } },
+}
+```
+
+You can also click **Hide Menu Bar** in Paneru's menu. This choice is saved across restarts and overrides `enabled`. To show the item again:
+
+```sh
+paneru showmenu
+```
+
+This command shows the item in the running daemon and remembers the new choice. Lua scripts can use `paneru.showmenu()` and `paneru.hidemenu()`, or bind `showmenu` and `hidemenu` to keys. Choices are stored in `$XDG_STATE_HOME/paneru/menu-bar.json` (normally `~/.local/state/paneru/menu-bar.json`); removing this file while Paneru is stopped restores the configuration's behavior.
+
+The permission setup menu remains visible until the required macOS access is granted.
 
 ### `[decorations.menu.descriptor]`
 Settings for the descriptor component of the menubar display. The descriptor component is a visual marker for the Paneru menubar item.
@@ -204,16 +272,24 @@ https://github.com/karinushka/paneru/blob/3790b01f8d65df5d9000142db7cf25f9270dcc
 | `window_manage` | Toggle between tiled and floating state. |
 | `window_stack` | Stack the current window into the column on the left. |
 | `window_unstack` | Pull a window out of a stack into its own column. |
+| `window_consume` | Consume the column to the right into the current column (stack it below). |
+| `window_expel` | Pull the focused window out of its stack into its own column on the right, keeping focus on the stack. |
 | `window_tabbeddisplay` | Toggle the focused stack between a normal split display and a tabbed display (one window visible at a time, sharing the full column). Cycle tabs with `window_focus_north`/`window_focus_south`. |
 | `window_equalize` | Make all windows in a stack equal height. |
 | `window_balance` | Make all columns in the strip the same width as the focused window. |
 | `window_nextdisplay` | Move focused window to the next monitor and follow it. |
 | `window_nextdisplaysend` | Move focused window to the next monitor but stay on current. |
+| `window_displaymove_<id>` | Move focused window to the monitor with this display ID and follow it. `paneru query active` reports display IDs. |
+| `window_displaysend_<id>` | Move focused window to the monitor with this display ID but stay on current. |
 | `mouse_nextdisplay` | Warp mouse cursor to the next monitor. |
+| `mouse_display_<id>` | Warp mouse cursor to the monitor with this display ID. |
 | `window_snap` | Snap an overflowing window into the viewport. |
 | `window_raise_floating` | Make the floating windows layer visible on the current workspace. |
 | `window_togglefloatlayer` | Selectively move the floating windows in front or behind of the workspace windows. |
 | `window_copyrule` | Copy a window rule template for the focused window to the clipboard. |
+| `overview` | Toggle the overview of every virtual workspace, as an alternative to the `overview_fingers` swipe (e.g. when docked without a trackpad). |
+| `showmenu` | Show the Paneru menu bar item and remember the choice across restarts. |
+| `hidemenu` | Hide the entire Paneru menu bar item and remember the choice across restarts. |
 | `quit` | Exit Paneru. |
 | `restart` | Restart the Paneru service (`paneru restart`). |
 
@@ -222,6 +298,7 @@ https://github.com/karinushka/paneru/blob/3790b01f8d65df5d9000142db7cf25f9270dcc
 [bindings]
 window_focus_west = "cmd - h"
 window_resize = ["alt - r", "ctrl - r"]
+overview = "alt - o"
 ```
 
 ### Virtual workspaces (Experimental)
@@ -284,25 +361,71 @@ $ paneru send-cmd window virtualsendnum 3
 See [QUERY_AND_SUBSCRIBE_FORMAT.md](QUERY_AND_SUBSCRIBE_FORMAT.md) for the
 structured `paneru query` responses and `paneru subscribe` event stream.
 
+### Native macOS Desktops (`desktop_*`)
+
+Paneru can also switch, create, close, reorder, and move/pin windows across native macOS Spaces (Mission Control Desktops) directly via `SkyLight` / `WMBridge`, bypassing macOS's slow slide animations.
+
+- **Display-local 1-based numbering:** `1..N` counts ordinary Desktops on the active display.
+- **Directional stepping (`west` / `east`):** `desktop_focus_west` and `desktop_focus_east` step across all managed Spaces on the display (including native Fullscreen Spaces, matching `Ctrl+Left/Right` without slide animations), clamping at display edges.
+- **Multi-Desktop pinning & sticky windows:** Windows carrying macOS's sticky bit (`0x800`), pinned via `desktop_pin_*`, assigned via `desktop_assign_all`, or matched by `[windows]` `desktop = "all"` automatically float (`Unmanaged::Floating`) so single-Desktop tiling strips never fight over their geometry.
+
+| Action | Description |
+| :--- | :--- |
+| `desktop_focus_west` / `_east` / `_first` / `_last` | Instant native Space switch on the active display (includes Fullscreen Spaces). |
+| `desktop_focus_<number>` | Instant switch to 1-based Desktop `<number>` on the active display. |
+| `desktop_move_west` / `_east` / `_<number>` | Move focused window (and its tab group) to target Desktop and follow it. Rescues unassociated guest windows out of single-owner Fullscreen Spaces. |
+| `desktop_send_west` / `_east` / `_<number>` | Send focused window (and its tab group) to target Desktop while staying on the current Desktop. |
+| `desktop_create` / `desktop_create_focus` | Append a new native Desktop on the active display (optionally switching to it). |
+| `desktop_destroy` / `desktop_destroy_empty` | Close the active Desktop (switching to an adjacent Desktop first and migrating windows unless `_empty` is used). |
+| `desktop_reorder_west` / `_east` / `_<number>` | Move the active Desktop to the target display-local Desktop index (when no Fullscreen Spaces are on the display). |
+| `desktop_swap_west` / `_east` / `_<number>` | Swap the active Desktop with another Desktop on the same display. |
+| `desktop_pin_all` / `desktop_pin_<number>` | Show the focused window across all Desktops (auto-joining future Desktops) or an additional Desktop. |
+| `desktop_unpin` | Collapse a pinned multi-Desktop window back onto the active Desktop. |
+| `desktop_assign_all` / `_this` / `_none` / `_<number>` | Ephemeral process-wide Space assignment (*Dock -> Options -> Assign To*) for the focused window's application. |
+
+**Example:**
+```toml
+[bindings]
+desktop_focus_west = "ctrl - leftarrow"
+desktop_focus_east = "ctrl - rightarrow"
+desktop_focus_1 = "ctrl - 1"
+desktop_focus_2 = "ctrl - 2"
+desktop_move_1 = "ctrl + shift - 1"
+desktop_move_2 = "ctrl + shift - 2"
+desktop_create_focus = "ctrl + alt - n"
+desktop_destroy = "ctrl + alt - w"
+desktop_pin_all = "ctrl + alt - p"
+desktop_unpin = "ctrl + alt + shift - p"
+```
+
 ---
 
 ## 6. Window Rules (`[windows]`)
 
-Define specific behaviors for applications based on their Title or Bundle ID.
+Define specific behaviors for applications based on their Title, Bundle ID, or
+accessibility role/subrole.
 
 | Option | Type | Description |
 | :--- | :--- | :--- |
 | `title` | Regex | **(Required)** Regex pattern to match the window title. |
 | `bundle_id` | String | Optional Bundle ID to match (e.g., `com.apple.Terminal`). |
+| `role` | String | Optional accessibility role to match exactly (e.g., `AXWindow`). A rule with `role` never matches a window that reports none. |
+| `subrole` | String | Optional accessibility subrole to match exactly (e.g., `AXStandardWindow`, `AXDialog`, `AXFloatingWindow`). A rule with `subrole` never matches a window that reports none. |
 | `floating` | Boolean | Force the window to be floating/unmanaged. |
 | `manage` | Boolean | Force Paneru to manage this app/window even if macOS reports the app as unobservable or the window has a non-standard role/subrole. |
 | `index` | Integer | Preferred position in the strip when spawned. |
+| `desktop` | Integer (`>= 1`) or `"all"` | Native macOS Desktop placement when spawned: sends the window to 1-based Desktop `N` on its display, or `"all"` to float and pin it across all current and future Desktops. |
 | `dont_focus` | Boolean | Prevent the window from taking focus when spawned. |
-| `width` | Positive Float | Initial width ratio for the window. Values above `1.0` create an oversized, horizontally scrollable window. |
+| `width` | Positive Float or `"complement_focused"` | Initial width ratio for the window. Values above `1.0` create an oversized, horizontally scrollable window. `"complement_focused"` uses `1.0` minus the focused window's width ratio; if there is no focused window or it is at least 95% wide, the new window starts at full width. |
 | `grid` | String | placement for floating windows: `"cols:rows:x:y:w:h"`. |
 | `horizontal_padding` | Integer | Gaps to the left/right of this window. |
 | `vertical_padding` | Integer | Gaps to the top/bottom of this window. |
 | `bindings_passthrough`| Array (String)| Keys that should bypass Paneru and go directly to the app. |
+
+For example, use `width = "complement_focused"` in a window rule to give each
+new window the width remaining beside the currently focused window. A new
+window opened from a full-width window also starts at full width. This width
+is chosen during initial placement, before the `window_spawned` Lua hook runs.
 
 **Example:**
 ```toml
@@ -311,6 +434,29 @@ title = ".*"
 bundle_id = "com.apple.Terminal"
 horizontal_padding = 5
 bindings_passthrough = ["ctrl-h", "ctrl-l"]
+```
+
+Windows whose subrole isn't `AXStandardWindow` or `AXFloatingWindow` (e.g.
+`AXDialog`) are ignored by Paneru unless a rule with `manage = true` matches
+them, so a `role`/`subrole` rule for such windows only takes effect for apps that
+are also force-managed.
+
+**Example:**
+```toml
+[windows.xcode]
+title = ".*"
+bundle_id = "com.apple.dt.Xcode"
+manage = true
+
+[windows.dialogs]
+title = ".*"
+subrole = "AXDialog"
+floating = true
+
+[windows.floating_window]
+title = ".*"
+subrole = "AXFloatingWindow"
+floating = true
 ```
 
 ### Copying a window rule
@@ -326,6 +472,8 @@ window on the clipboard, ready to paste:
 bundle_id = "com.mitchellh.ghostty"
 title = "^paneru — zsh$"
 # title = ".*"   # all windows of this app
+# role = "AXWindow"
+# subrole = "AXStandardWindow"
 # app: Ghostty  role: AXWindow  subrole: AXStandardWindow
 # floating = true
 # manage = true
@@ -335,9 +483,11 @@ title = "^paneru — zsh$"
 The two matchers are live; everything else is a comment for you to uncomment.
 `title` is anchored and regex-escaped so it matches only this window — swap in
 the commented `.*` to cover every window of the app instead. The `app`, `role`
-and `subrole` line is there to tell one pasted rule from the next; none of those
-are matchable. When an `init.lua` is in charge, the snippet is written as a Lua
-table instead of TOML.
+and `subrole` line is there to tell one pasted rule from the next. `role` and
+`subrole` are also offered as commented-out matchers above it (omitted when the
+window doesn't report one); uncomment them to target, say, only an app's
+dialogs (with `manage = true`, see above). When an `init.lua` is in charge, the
+snippet is written as a Lua table instead of TOML.
 
 ### Forcing management of LSUIElement or non-standard windows
 
@@ -458,6 +608,7 @@ Draws a colored border around the currently focused window.
 | :--- | :--- | :--- | :--- |
 | `enabled` | Boolean | `false` | Enable the active window border. |
 | `color` | String (Hex) | `"#FFFFFF"` | Hex color for the active window border. |
+| `color_night` | String (Hex) | *color* | Hex color for the active window border when macOS is in Dark Mode. |
 | `opacity` | Float (0.0–1.0) | `1.0` | Opacity of the active window border. |
 | `width` | Float (px) | `2.0` | Width of the border in pixels. |
 | `radius` | Number/String | `"auto"` | Corner radius in pixels or `"auto"` to match system. |
@@ -467,11 +618,39 @@ Draws a colored border around the currently focused window.
 [decorations.active.border]
 enabled = true
 color = "#89b4fa"
+color_night = "#cba6f7"
 width = 2.0
 radius = 12.0
 ```
 
+In Dark Mode, the border uses `color_night`.
+If `color_night` is not set, the border uses `color`, then the legacy `border_color` option, then white.
+In Light Mode, the border ignores `color_night`.
+The border changes color immediately when the macOS appearance changes.
+
 > **Tip:** You can override the `border_radius` for specific applications in the `[windows]` section. See [Window Rules](#6-window-rules).
+
+### `[decorations.tab_indicator]`
+
+A thin clickable strip drawn along one edge of a tabbed-display column (`window_tabbeddisplay`, see [Keybindings](#5-keybindings)) — one segment per tab, the active one highlighted, click a segment to switch straight to that tab.
+
+| Option | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `enabled` | Bool | `true` | Whether the indicator is drawn on a tabbed column. |
+| `position` | String | `'left'` | Which edge of the column the indicator sits against: `'left'`, `'right'`, `'top'`, or `'bottom'`. |
+| `width` | Float (px) | `6.0` | Thickness of the indicator strip. |
+| `gap` | Float (px) | `4.0` | Gap between the indicator and the column it belongs to. |
+| `segment_gap` | Float (px) | `2.0` | Gap between adjacent tab segments. |
+| `active_color` | String (Hex) | `"#5AC8FA"` | Color of the active tab's segment. |
+| `inactive_color` | String (Hex) | `"#666666"` | Color of inactive tab segments. |
+
+**Example:**
+```toml
+[decorations.tab_indicator]
+position = "left"
+active_color = "#89b4fa"
+inactive_color = "#45475a"
+```
 
 ## 8. Lua Scripting
 

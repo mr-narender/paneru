@@ -1,0 +1,666 @@
+use crate::commands::{Command, Direction, MoveFocus, Operation};
+use crate::config::{Config, MainOptions};
+use crate::events::Event;
+use crate::manager::{Origin, Window, WindowManager};
+use crate::platform::Modifiers;
+use crate::{assert_focused, assert_on_workspace};
+use bevy::math::IRect;
+use objc2_core_foundation::CGPoint;
+use std::time::Duration;
+
+use super::*;
+
+#[test]
+fn mouse_focus_resumes_after_slide_without_intermediate_mouse_events() {
+    let config: Config = (
+        MainOptions {
+            auto_center: Some(true),
+            focus_follows_mouse: Some(true),
+            animation_speed: Some(30.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let commands = vec![
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::First)),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(2)
+        .on_iteration(2, |world, _state| {
+            assert_focused!(world, 0);
+            let previous = find_window_entity(1, world);
+            let center = world.get::<Window>(previous).unwrap().frame().center();
+            world.write_message(Event::MouseMoved {
+                point: CGPoint {
+                    x: f64::from(center.x),
+                    y: f64::from(center.y),
+                },
+                modifiers: Modifiers::empty(),
+            });
+        })
+        .on_iteration(3, |world, _state| assert_focused!(world, 1))
+        .run(commands);
+}
+
+#[test]
+fn keyboard_focus_survives_mouse_movement_during_slide() {
+    for (direction, start, target) in [
+        (Direction::East, Direction::First, 2),
+        (Direction::West, Direction::Last, 0),
+    ] {
+        for (same_frame, mouse_follows_focus, auto_center) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, false),
+            (true, true, false),
+            (false, false, true),
+            (false, true, true),
+            (true, false, true),
+            (true, true, true),
+        ] {
+            let previous = 1;
+            let config: Config = (
+                MainOptions {
+                    auto_center: Some(auto_center),
+                    mouse_follows_focus: Some(mouse_follows_focus),
+                    focus_follows_mouse: Some(true),
+                    animation_speed: Some(12.0),
+                    ..Default::default()
+                },
+                vec![],
+            )
+                .into();
+            let mut harness = TestHarness::new().with_config(config).with_windows(4);
+            harness.run(vec![
+                Event::Command {
+                    command: Command::PrintState,
+                },
+                Event::Command {
+                    command: Command::Window(Operation::Focus(start.clone())),
+                },
+                Event::Command {
+                    command: Command::Window(Operation::Focus(Direction::Nth(1))),
+                },
+            ]);
+            harness.advance(Duration::from_secs(1));
+            assert_focused!(harness.world(), previous);
+
+            harness.world().write_message(Event::Command {
+                command: Command::Window(Operation::Focus(direction.clone())),
+            });
+            if !same_frame {
+                harness.advance(Duration::from_millis(20));
+                assert_focused!(harness.world(), target);
+                assert!(
+                    harness
+                        .world()
+                        .query::<&crate::ecs::RepositionMarker>()
+                        .iter(harness.world())
+                        .next()
+                        .is_some(),
+                    "the mouse event must arrive during the slide"
+                );
+            }
+
+            let previous_entity = find_window_entity(previous, harness.world());
+            let center = harness
+                .world()
+                .get::<Window>(previous_entity)
+                .unwrap()
+                .frame()
+                .center();
+            harness.world().write_message(Event::MouseMoved {
+                point: CGPoint {
+                    x: f64::from(center.x),
+                    y: f64::from(center.y),
+                },
+                modifiers: Modifiers::empty(),
+            });
+            harness.advance(Duration::from_millis(20));
+            assert_focused!(harness.world(), target);
+            harness.advance(Duration::from_secs(2));
+            assert_focused!(harness.world(), target);
+
+            // Mouse focus must resume once the keyboard-driven slide finishes.
+            let center = harness
+                .world()
+                .get::<Window>(previous_entity)
+                .unwrap()
+                .frame()
+                .center();
+            harness.world().write_message(Event::MouseMoved {
+                point: CGPoint {
+                    x: f64::from(center.x),
+                    y: f64::from(center.y),
+                },
+                modifiers: Modifiers::empty(),
+            });
+            harness.advance(Duration::from_millis(100));
+            assert_focused!(harness.world(), previous);
+        }
+    }
+}
+
+#[test]
+fn keyboard_focus_warps_mouse_to_centered_window() {
+    for speed in [12.0, 30.0] {
+        let config: Config = (
+            MainOptions {
+                auto_center: Some(true),
+                mouse_follows_focus: Some(true),
+                focus_follows_mouse: Some(false),
+                animation_speed: Some(speed),
+                ..Default::default()
+            },
+            vec![],
+        )
+            .into();
+        let mut harness = TestHarness::new().with_config(config).with_windows(3);
+        let mut commands = vec![Event::Command {
+            command: Command::PrintState,
+        }];
+
+        // Include a jump to a window initially outside the viewport.
+        for (direction, window_id) in [
+            (Direction::First, 0),
+            (Direction::Last, 2),
+            (Direction::West, 1),
+            (Direction::East, 2),
+        ] {
+            commands.push(Event::Command {
+                command: Command::Window(Operation::Focus(direction)),
+            });
+            // Allow another command interval for the slower animation to settle.
+            commands.push(Event::Command {
+                command: Command::PrintState,
+            });
+            harness = harness.on_iteration(commands.len() - 1, move |world, state| {
+                assert_focused!(world, window_id);
+                let window = world.query::<&Window>().iter(world)
+                    .find(|window| window.id() == window_id)
+                    .expect("focused window");
+                let center = window.frame().center();
+                assert!((center.x - TEST_DISPLAY_WIDTH / 2).abs() <= 2,
+                    "window should have finished centering: {center:?}");
+                let cursor = state.cursor_position();
+                assert!((cursor.x - center.x).abs() <= 2 && window.frame().contains(cursor),
+                    "speed {speed}: pointer {cursor:?} was left behind after window {window_id} centered at {center:?}");
+            });
+        }
+        harness.run(commands);
+    }
+}
+
+#[test]
+fn keyboard_focus_warps_mouse_without_auto_center() {
+    for speed in [12.0, 30.0] {
+        let config: Config = (
+            MainOptions {
+                auto_center: Some(false),
+                mouse_follows_focus: Some(true),
+                focus_follows_mouse: Some(false),
+                animation_speed: Some(speed),
+                ..Default::default()
+            },
+            vec![],
+        )
+            .into();
+        let mut harness = TestHarness::new().with_config(config).with_windows(4);
+        let mut commands = vec![Event::Command {
+            command: Command::PrintState,
+        }];
+
+        // Include jumps to windows partially and completely outside the viewport.
+        for (direction, window_id) in [
+            (Direction::First, 0),
+            (Direction::Last, 3),
+            (Direction::West, 2),
+            (Direction::East, 3),
+            (Direction::First, 0),
+        ] {
+            commands.push(Event::Command {
+                command: Command::Window(Operation::Focus(direction)),
+            });
+            // Allow another command interval for the slower animation to settle.
+            commands.push(Event::Command {
+                command: Command::PrintState,
+            });
+            harness = harness.on_iteration(commands.len() - 1, move |world, state| {
+                assert_focused!(world, window_id);
+                let window = world.query::<&Window>().iter(world)
+                    .find(|window| window.id() == window_id)
+                    .expect("focused window");
+                let center = window.frame().center();
+                let cursor = state.cursor_position();
+                assert!((cursor - center).abs().max_element() <= 2,
+                    "speed {speed}: pointer {cursor:?} missed focused window {window_id} at {center:?}");
+            });
+        }
+        harness.run(commands);
+    }
+}
+
+#[test]
+fn keyboard_focus_does_not_warp_mouse_when_disabled() {
+    let config: Config = (
+        MainOptions {
+            auto_center: Some(true),
+            mouse_follows_focus: Some(false),
+            focus_follows_mouse: Some(false),
+            animation_speed: Some(30.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let commands = vec![
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Last)),
+        },
+    ];
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(3)
+        .on_iteration(1, |world, state| {
+            assert_focused!(world, 2);
+            assert_eq!(state.cursor_position(), Origin::ZERO);
+        })
+        .run(commands);
+}
+
+#[test]
+fn virtual_workspace_focus_warps_mouse_to_restored_window() {
+    for animations in [false, true] {
+        let config: Config = (
+            MainOptions {
+                auto_center: Some(true),
+                mouse_follows_focus: Some(true),
+                focus_follows_mouse: Some(false),
+                animation_speed: Some(30.0),
+                virtual_workspace_animations: Some(animations),
+                ..Default::default()
+            },
+            vec![],
+        )
+            .into();
+        let mut harness = TestHarness::new().with_config(config).with_windows(3);
+        let mut commands = vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
+            },
+        ];
+        for (iteration, (direction, window_id)) in [
+            (Direction::South, 0),
+            (Direction::North, 1),
+            (Direction::South, 0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            commands.push(Event::Command {
+                command: Command::Window(Operation::FocusOrVirtual(direction)),
+            });
+            harness = harness.on_iteration(iteration + 2, move |world, state| {
+                assert_focused!(world, window_id);
+                let window = world.query::<&Window>().iter(world)
+                    .find(|window| window.id() == window_id)
+                    .expect("restored window");
+                let center = window.frame().center();
+                let cursor = state.cursor_position();
+                assert!((cursor - center).abs().max_element() <= 2,
+                    "animations {animations}: pointer {cursor:?} missed restored window {window_id} at {center:?}");
+            });
+        }
+        harness.run(commands);
+    }
+}
+
+/// `window center` warps the pointer to the display's centre only when the
+/// pointer follows focus: with it off the pointer stays where the user left it.
+#[test]
+fn window_center_warps_mouse_only_when_it_follows_focus() {
+    for follows in [false, true] {
+        let config: Config = (
+            MainOptions {
+                auto_center: Some(false),
+                mouse_follows_focus: Some(follows),
+                focus_follows_mouse: Some(false),
+                animation_speed: Some(30.0),
+                ..Default::default()
+            },
+            vec![],
+        )
+            .into();
+        let commands = vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::Window(Operation::Center),
+            },
+        ];
+        TestHarness::new()
+            .with_config(config)
+            .with_windows(2)
+            .on_iteration(1, move |_, state| {
+                if follows {
+                    assert_ne!(state.cursor_position(), Origin::ZERO);
+                } else {
+                    assert_eq!(state.cursor_position(), Origin::ZERO);
+                }
+            })
+            .run(commands);
+    }
+}
+
+/// Moving a window to the next display warps the pointer to that display only
+/// when the pointer follows focus: with it off the pointer stays where it was.
+#[test]
+fn to_next_display_warps_mouse_only_when_it_follows_focus() {
+    let ext_bounds = IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0);
+    for follows in [false, true] {
+        let config: Config = (
+            MainOptions {
+                mouse_follows_focus: Some(follows),
+                focus_follows_mouse: Some(false),
+                ..Default::default()
+            },
+            vec![],
+        )
+            .into();
+        let commands = vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::Window(Operation::ToNextDisplay(MoveFocus::Follow)),
+            },
+        ];
+        TestHarness::new()
+            .with_config(config)
+            .with_windows(1)
+            .with_display(EXT_DISPLAY_ID, ext_bounds, vec![EXT_WORKSPACE_ID])
+            .on_iteration(1, move |world, state| {
+                assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+                if follows {
+                    assert!(ext_bounds.contains(state.cursor_position()));
+                } else {
+                    assert_eq!(state.cursor_position(), Origin::ZERO);
+                }
+            })
+            .run(commands);
+    }
+}
+
+#[test]
+fn click_focus_leaves_the_pointer_where_the_user_clicked() {
+    for focus_after_release in [false, true] {
+        let config: Config = (
+            MainOptions {
+                auto_center: Some(true),
+                mouse_follows_focus: Some(true),
+                focus_follows_mouse: Some(false),
+                animation_speed: Some(30.0),
+                ..Default::default()
+            },
+            vec![],
+        )
+            .into();
+        let pointer = std::sync::Arc::new(std::sync::Mutex::new(Origin::ZERO));
+        let recorded = pointer.clone();
+        let commands = vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::Window(Operation::Focus(Direction::West)),
+            },
+            Event::Command {
+                command: Command::Window(Operation::Focus(Direction::East)),
+            },
+        ];
+        TestHarness::new()
+            .with_config(config)
+            .with_windows(3)
+            .on_iteration(0, move |world, state| {
+                assert_focused!(world, 0);
+                let clicked = find_window_entity(1, world);
+                let corner =
+                    world.get::<Window>(clicked).unwrap().frame().min + Origin::new(10, 10);
+                world.resource::<WindowManager>().warp_mouse(corner);
+                *recorded.lock().expect("pointer lock") = corner;
+                let point = CGPoint {
+                    x: f64::from(corner.x),
+                    y: f64::from(corner.y),
+                };
+                world.write_message(Event::MouseDown {
+                    point,
+                    button: crate::events::MouseButton::Left,
+                    modifiers: Modifiers::empty(),
+                });
+                if focus_after_release {
+                    world.write_message(Event::MouseUp {
+                        point,
+                        button: crate::events::MouseButton::Left,
+                        modifiers: Modifiers::empty(),
+                    });
+                }
+                state.focus_window(1);
+            })
+            .on_iteration(1, move |world, _state| {
+                assert_focused!(world, 1);
+                if !focus_after_release {
+                    world.write_message(Event::MouseUp {
+                        point: CGPoint { x: 0.0, y: 0.0 },
+                        button: crate::events::MouseButton::Left,
+                        modifiers: Modifiers::empty(),
+                    });
+                }
+            })
+            .on_iteration(2, {
+                let pointer = pointer.clone();
+                move |world, state| {
+                    assert_focused!(world, 1);
+                    assert_eq!(
+                        state.cursor_position(),
+                        *pointer.lock().expect("pointer lock"),
+                        "focus after release {focus_after_release}: a click focus moved the pointer"
+                    );
+                }
+            })
+            .on_iteration(3, {
+                let pointer = pointer.clone();
+                move |world, _state| {
+                    assert_focused!(world, 0);
+                    let corner = Origin::new(10, 10);
+                    world.resource::<WindowManager>().warp_mouse(corner);
+                    *pointer.lock().expect("pointer lock") = corner;
+                }
+            })
+            .on_iteration(4, move |world, state| {
+                assert_focused!(world, 1);
+                assert_ne!(
+                    state.cursor_position(),
+                    *pointer.lock().expect("pointer lock"),
+                    "subsequent keyboard focus back to the clicked window must still warp the pointer"
+                );
+            })
+            .run(commands);
+    }
+}
+
+#[test]
+fn clicking_already_focused_window_does_not_recenter_strip() {
+    use crate::ecs::layout::LayoutStrip;
+    use crate::ecs::{ActiveWorkspaceMarker, Position, RepositionMarker};
+    use bevy::ecs::entity::Entity;
+    use bevy::ecs::query::With;
+
+    let config: Config = (
+        MainOptions {
+            auto_center: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(2)
+        .on_iteration(0, |world, _state| {
+            assert_focused!(world, 0);
+            // Simulate the user swiping the active strip slightly off-center (x = 80).
+            let strip_entity = world
+                .query_filtered::<Entity, (With<LayoutStrip>, With<ActiveWorkspaceMarker>)>()
+                .single(world)
+                .expect("active strip");
+            world.entity_mut(strip_entity).remove::<RepositionMarker>();
+            world.get_mut::<Position>(strip_entity).unwrap().0.x = 80;
+            let focused = find_window_entity(0, world);
+            world.entity_mut(focused).remove::<RepositionMarker>();
+            world.get_mut::<Position>(focused).unwrap().0.x = 80;
+            world
+                .get_mut::<Window>(focused)
+                .unwrap()
+                .reposition(Origin::new(80, 0));
+
+            let point = CGPoint { x: 100.0, y: 100.0 };
+            world.write_message(Event::MouseDown {
+                point,
+                button: crate::events::MouseButton::Left,
+                modifiers: Modifiers::empty(),
+            });
+            world.write_message(Event::MouseUp {
+                point,
+                button: crate::events::MouseButton::Left,
+                modifiers: Modifiers::empty(),
+            });
+        })
+        .on_iteration(2, |world, _state| {
+            assert_focused!(world, 0);
+            let strip_entity = world
+                .query_filtered::<Entity, (With<LayoutStrip>, With<ActiveWorkspaceMarker>)>()
+                .single(world)
+                .expect("active strip");
+            assert_eq!(
+                world.get::<Position>(strip_entity).unwrap().0.x,
+                80,
+                "clicking inside an already-focused window must not snap the strip back to center"
+            );
+            assert!(
+                world.get::<RepositionMarker>(strip_entity).is_none(),
+                "clicking inside an already-focused window must not schedule a strip reposition"
+            );
+        })
+        .run(commands);
+}
+
+#[test]
+fn clicking_partially_offscreen_focused_window_brings_it_into_view() {
+    use crate::ecs::layout::LayoutStrip;
+    use crate::ecs::{ActiveWorkspaceMarker, Position, RepositionMarker};
+    use bevy::ecs::entity::Entity;
+    use bevy::ecs::query::With;
+
+    let config: Config = (
+        MainOptions {
+            auto_center: Some(false),
+            window_hidden_ratio: Some(0.1),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(2)
+        .on_iteration(0, |world, _state| {
+            assert_focused!(world, 0);
+            // Move the active strip to x = -150 so 150px of the 500px window (30% > 10%) is off-screen.
+            let strip_entity = world
+                .query_filtered::<Entity, (With<LayoutStrip>, With<ActiveWorkspaceMarker>)>()
+                .single(world)
+                .expect("active strip");
+            world.entity_mut(strip_entity).remove::<RepositionMarker>();
+            world.get_mut::<Position>(strip_entity).unwrap().0.x = -150;
+            let focused = find_window_entity(0, world);
+            world.entity_mut(focused).remove::<RepositionMarker>();
+            world.get_mut::<Position>(focused).unwrap().0.x = -150;
+            world
+                .get_mut::<Window>(focused)
+                .unwrap()
+                .reposition(Origin::new(-150, 0));
+
+            let point = CGPoint { x: 100.0, y: 100.0 };
+            world.write_message(Event::MouseDown {
+                point,
+                button: crate::events::MouseButton::Left,
+                modifiers: Modifiers::empty(),
+            });
+            world.write_message(Event::MouseUp {
+                point,
+                button: crate::events::MouseButton::Left,
+                modifiers: Modifiers::empty(),
+            });
+        })
+        .on_iteration(2, |world, _state| {
+            let strip_entity = world
+                .query_filtered::<Entity, (With<LayoutStrip>, With<ActiveWorkspaceMarker>)>()
+                .single(world)
+                .expect("active strip");
+            let strip_target = world.get::<RepositionMarker>(strip_entity).map_or_else(
+                || world.get::<Position>(strip_entity).unwrap().0.x,
+                |r| r.0.x,
+            );
+            assert_eq!(
+                strip_target, 0,
+                "clicking a partially off-screen focused window must bring it fully into view"
+            );
+        })
+        .run(commands);
+}

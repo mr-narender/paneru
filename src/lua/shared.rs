@@ -1,0 +1,1088 @@
+//! The `paneru` Lua API, in both the shapes it is used in.
+//!
+//! [`install`] puts the typed, host-agnostic API onto a table — `paneru.run`,
+//! `paneru.window.*`, `paneru.workspace.*`, `paneru.mouse.*` — built on a
+//! caller-supplied dispatcher. The daemon's embedded runtime (`src/lua`) hands
+//! it one that queues the [`Command`] onto the command bus; [`client`] hands it
+//! one that writes the command to a running daemon's Unix socket, and adds the
+//! client-only `query_*` / `subscribe` helpers on top.
+//!
+//! With the `module` feature the crate additionally builds as a loadable Lua C
+//! extension (`paneru.so`) exposing that client table:
+//!
+//! ```lua
+//! local paneru = require("paneru")
+//!
+//! paneru.window.focus({ direction = "east" })   -- directional
+//! paneru.window.focus({ number = 3 })           -- by column number
+//! paneru.window.balance()
+//! paneru.workspace.select({ number = 2 })       -- switch virtual workspace
+//! paneru.workspace.move_window({ number = 2, follow = false })
+//! paneru.workspace.add()                        -- create + switch to a new virtual workspace
+//! paneru.quit()
+//!
+//! for _, window in ipairs(paneru.query_on_screen()) do  -- actually visible
+//!   print(window.app_name, window.title)
+//! end
+//!
+//! paneru.state.set("pads.term", 4213)          -- outlives reloads and restarts
+//! paneru.state.mutate("count", function(n) return (n or 0) + 1 end)
+//!
+//! paneru.subscribe("window_focused", function(evt)  -- blocking; run in a helper process
+//!   print(evt.title)
+//! end)
+//!
+//! paneru.subscribe(nil, function(evt) ... end)  -- nil event = every event
+//! paneru.subscribe({ "window_focused", "window_title_changed" }, function(evt) ... end)
+//! ```
+//!
+//! Every verb builds a real [`Command`]: option tables are deserialized into
+//! the actual enums with mlua's serde support, so `"east"` becomes
+//! [`Direction::East`] and an unknown value fails at the call site. Only the
+//! host-specific extras differ (`paneru.on` / `paneru.bind` are embedded-only;
+//! `subscribe` and the socket-path helpers are client-only).
+
+#![allow(
+    clippy::needless_pass_by_value,
+    reason = "mlua callback signatures are by-value by contract"
+)]
+
+use std::rc::Rc;
+
+use mlua::{Function, Lua, LuaSerdeExt, Result, Table, Value};
+use regex::Regex;
+use serde::Deserialize;
+
+use crate::types::commands::{
+    Command, DesktopAssignTarget, DesktopOperation, DesktopPinTarget, DesktopTarget, Direction,
+    MouseMove, MoveFocus, Operation, ResizeDirection, parse_command,
+};
+
+/// Issues a [`Command`]. The only thing the two hosts differ by.
+pub type Dispatch = Rc<dyn Fn(&Lua, Command) -> Result<bool>>;
+
+/// Installs the shared API onto the `paneru` table, building every verb on
+/// `dispatch`.
+///
+/// # Errors
+///
+/// Returns an error if any Lua table/function creation or assignment fails.
+pub fn install(lua: &Lua, paneru: &Table, dispatch: &Dispatch) -> Result<()> {
+    // paneru.run(cmd) / paneru.command(cmd) — the escape hatch: a command
+    // string, an argv table, or a structured command table.
+    let run = {
+        let dispatch = Rc::clone(dispatch);
+        lua.create_function(move |lua, command: Value| dispatch(lua, to_command(lua, &command)?))?
+    };
+    paneru.set("run", run.clone())?;
+    paneru.set("command", run)?;
+
+    paneru.set("window", window_table(lua, dispatch)?)?;
+    paneru.set("workspace", workspace_table(lua, dispatch)?)?;
+    paneru.set("desktop", desktop_table(lua, dispatch)?)?;
+
+    let mouse = lua.create_table()?;
+    mouse.set(
+        "next_display",
+        verb(lua, dispatch, Command::Mouse(MouseMove::ToNextDisplay))?,
+    )?;
+    paneru.set("mouse", mouse)?;
+
+    paneru.set("showmenu", verb(lua, dispatch, Command::MenuBar(true))?)?;
+    paneru.set("hidemenu", verb(lua, dispatch, Command::MenuBar(false))?)?;
+    paneru.set("overview", verb(lua, dispatch, Command::Overview)?)?;
+
+    paneru.set("quit", verb(lua, dispatch, Command::Quit)?)?;
+    paneru.set("restart", verb(lua, dispatch, Command::Restart)?)?;
+    paneru.set("print_state", verb(lua, dispatch, Command::PrintState)?)?;
+
+    // paneru.match{ app = …, bundle = …, title = …, role = …, subrole = …, floating = …, managed = … }
+    // builds a predicate over window records, for `ws:find`/`ws:filter`.
+    // `app`, `bundle` and `title` are regexes, compiled here so a bad pattern
+    // errors at the call site rather than silently matching nothing.
+    paneru.set("match", lua.create_function(matcher)?)?;
+
+    Ok(())
+}
+
+/// One `paneru.match{…}` call: compiles the spec into a Lua predicate.
+///
+/// # Errors
+///
+/// Returns a Lua runtime error if regex compilation fails or an unknown field is present.
+pub fn matcher(lua: &Lua, spec: Table) -> Result<Function> {
+    let pattern = |field: &str| -> Result<Option<Regex>> {
+        let Some(pattern) = spec.get::<Option<String>>(field)? else {
+            return Ok(None);
+        };
+        Regex::new(&pattern)
+            .map(Some)
+            .map_err(|err| mlua::Error::RuntimeError(format!("paneru.match: {field}: {err}")))
+    };
+    let (app, bundle, title) = (pattern("app")?, pattern("bundle")?, pattern("title")?);
+    let role: Option<String> = spec.get("role")?;
+    let subrole: Option<String> = spec.get("subrole")?;
+    let floating: Option<bool> = spec.get("floating")?;
+    let managed: Option<bool> = spec.get("managed")?;
+
+    for entry in spec.pairs::<String, Value>() {
+        let (key, _) = entry?;
+        if !matches!(
+            key.as_str(),
+            "app" | "bundle" | "title" | "role" | "subrole" | "floating" | "managed"
+        ) {
+            return Err(mlua::Error::RuntimeError(format!(
+                "paneru.match: unknown field '{key}'"
+            )));
+        }
+    }
+
+    lua.create_function(move |_, window: Table| {
+        let matches = |regex: &Option<Regex>, fields: &[&str]| -> Result<bool> {
+            let Some(regex) = regex else {
+                return Ok(true);
+            };
+            for field in fields {
+                if let Ok(val) = window.get::<String>(*field) {
+                    return Ok(regex.is_match(&val));
+                }
+            }
+            Ok(false)
+        };
+        let exact = |want: &Option<String>, field: &str| -> bool {
+            let Some(want) = want else {
+                return true;
+            };
+            window.get::<String>(field).is_ok_and(|val| val == *want)
+        };
+        let flag = |want: Option<bool>, field: &str| -> Result<bool> {
+            match want {
+                Some(want) => Ok(window.get::<bool>(field)? == want),
+                None => Ok(true),
+            }
+        };
+        Ok(matches(&app, &["app_name", "app"])?
+            && matches(&bundle, &["bundle_id", "bundle"])?
+            && matches(&title, &["title"])?
+            && exact(&role, "role")
+            && exact(&subrole, "subrole")
+            && flag(floating, "floating")?
+            && flag(managed, "managed")?)
+    })
+}
+
+/// Builds the `paneru.window` sub-table.
+fn window_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
+    let window = lua.create_table()?;
+
+    window.set(
+        "focus",
+        directional(lua, dispatch, "window.focus", Operation::Focus)?,
+    )?;
+    window.set(
+        "swap",
+        directional(lua, dispatch, "window.swap", Operation::Swap)?,
+    )?;
+    window.set("resize", resize(lua, dispatch)?)?;
+    window.set("vertical_resize", vertical_resize(lua, dispatch)?)?;
+    window.set(
+        "next_display",
+        follower(lua, dispatch, Operation::ToNextDisplay)?,
+    )?;
+
+    for (name, operation) in [
+        ("focus_managed", Operation::FocusManaged),
+        ("focus_unmanaged", Operation::FocusUnmanaged),
+        ("center", Operation::Center),
+        ("snap", Operation::Snap),
+        ("manage", Operation::Manage),
+        ("equalize", Operation::Equalize),
+        ("balance", Operation::Balance),
+        ("stack", Operation::Stack(true)),
+        ("unstack", Operation::Stack(false)),
+        ("consume", Operation::Consume),
+        ("expel", Operation::Expel),
+        ("full_width", Operation::FullWidth),
+        ("grow", Operation::Resize(ResizeDirection::Grow)),
+        ("shrink", Operation::Resize(ResizeDirection::Shrink)),
+        (
+            "vertical_grow",
+            Operation::ResizeVertical(ResizeDirection::Grow),
+        ),
+        (
+            "vertical_shrink",
+            Operation::ResizeVertical(ResizeDirection::Shrink),
+        ),
+        ("raise_floating", Operation::RaiseFloating),
+        ("toggle_float_layer", Operation::ToggleFloatingLayer),
+    ] {
+        window.set(name, verb(lua, dispatch, Command::Window(operation))?)?;
+    }
+
+    Ok(window)
+}
+
+/// Builds the `paneru.workspace` sub-table.
+fn workspace_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
+    let workspace = lua.create_table()?;
+
+    let select = {
+        let dispatch = Rc::clone(dispatch);
+        lua.create_function(move |lua, opts: Value| {
+            let operation = virtual_operation(
+                Opts::read(lua, &opts)?.target("workspace.select")?,
+                Operation::VirtualNumber,
+                Operation::Virtual,
+            )?;
+            dispatch(lua, Command::Window(operation))
+        })?
+    };
+    workspace.set("select", select)?;
+
+    let move_window = {
+        let dispatch = Rc::clone(dispatch);
+        lua.create_function(move |lua, opts: Value| {
+            let opts = Opts::read(lua, &opts)?;
+            let follow = opts.follow();
+            let operation = virtual_operation(
+                opts.target("workspace.move_window")?,
+                |index| Operation::VirtualMoveNumber(index, follow),
+                |direction| Operation::VirtualMove(direction, follow),
+            )?;
+            dispatch(lua, Command::Window(operation))
+        })?
+    };
+    workspace.set("move_window", move_window)?;
+
+    workspace.set(
+        "add",
+        verb(lua, dispatch, Command::Window(Operation::VirtualAdd))?,
+    )?;
+
+    Ok(workspace)
+}
+
+/// Builds the `paneru.desktop` sub-table for native macOS Spaces / Desktops.
+fn desktop_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
+    let desktop = lua.create_table()?;
+
+    desktop.set(
+        "focus",
+        desktop_target_verb(lua, dispatch, "desktop.focus", DesktopOperation::Focus)?,
+    )?;
+    desktop.set(
+        "reorder",
+        desktop_target_verb(lua, dispatch, "desktop.reorder", DesktopOperation::Reorder)?,
+    )?;
+    desktop.set(
+        "swap",
+        desktop_target_verb(lua, dispatch, "desktop.swap", DesktopOperation::Swap)?,
+    )?;
+
+    let move_window = {
+        let dispatch = Rc::clone(dispatch);
+        lua.create_function(move |lua, opts: Value| {
+            let (target, move_focus) = match &opts {
+                Value::Table(_) => {
+                    let parsed: MoveWindowOpts = lua.from_value(opts)?;
+                    let target = require_desktop_target(
+                        "desktop.move_window",
+                        parsed.direction.as_deref(),
+                        parsed.number,
+                        parsed.space_id,
+                        parsed.display,
+                    )?;
+                    (target, MoveFocus::follows(parsed.follow.unwrap_or(true)))
+                }
+                _ => (
+                    parse_scalar_desktop_target(&opts, "desktop.move_window")?,
+                    MoveFocus::Follow,
+                ),
+            };
+            dispatch(
+                lua,
+                Command::Desktop(DesktopOperation::MoveWindow { target, move_focus }),
+            )
+        })?
+    };
+    desktop.set("move_window", move_window)?;
+
+    desktop.set(
+        "send_window",
+        desktop_target_verb(lua, dispatch, "desktop.send_window", |target| {
+            DesktopOperation::MoveWindow {
+                target,
+                move_focus: MoveFocus::Stay,
+            }
+        })?,
+    )?;
+
+    desktop.set("create", desktop_create_verb(lua, dispatch)?)?;
+    desktop.set("destroy", desktop_destroy_verb(lua, dispatch)?)?;
+    desktop.set("pin", desktop_pin_verb(lua, dispatch)?)?;
+    desktop.set(
+        "unpin",
+        verb(lua, dispatch, Command::Desktop(DesktopOperation::Unpin))?,
+    )?;
+    desktop.set("assign", desktop_assign_verb(lua, dispatch)?)?;
+
+    Ok(desktop)
+}
+
+fn desktop_target_verb(
+    lua: &Lua,
+    dispatch: &Dispatch,
+    what: &'static str,
+    op: impl Fn(DesktopTarget) -> DesktopOperation + 'static,
+) -> Result<Function> {
+    let dispatch = Rc::clone(dispatch);
+    lua.create_function(move |lua, opts: Value| {
+        let target = match &opts {
+            Value::Table(_) => {
+                let parsed: DesktopTargetOpts = lua.from_value(opts)?;
+                require_desktop_target(
+                    what,
+                    parsed.direction.as_deref(),
+                    parsed.number,
+                    parsed.space_id,
+                    parsed.display,
+                )?
+            }
+            _ => parse_scalar_desktop_target(&opts, what)?,
+        };
+        dispatch(lua, Command::Desktop(op(target)))
+    })
+}
+
+fn desktop_create_verb(lua: &Lua, dispatch: &Dispatch) -> Result<Function> {
+    #[derive(Default, Deserialize)]
+    #[serde(default, deny_unknown_fields)]
+    struct CreateOpts {
+        focus: Option<bool>,
+    }
+
+    let dispatch = Rc::clone(dispatch);
+    lua.create_function(move |lua, opts: Value| {
+        let focus = match opts {
+            Value::Nil => false,
+            Value::Boolean(b) => b,
+            Value::Table(_) => lua.from_value::<CreateOpts>(opts)?.focus.unwrap_or(false),
+            other => {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "desktop.create expects nil, boolean or {{ focus = bool }}, got {}",
+                    other.type_name()
+                )));
+            }
+        };
+        dispatch(lua, Command::Desktop(DesktopOperation::Create { focus }))
+    })
+}
+
+fn desktop_destroy_verb(lua: &Lua, dispatch: &Dispatch) -> Result<Function> {
+    let dispatch = Rc::clone(dispatch);
+    lua.create_function(move |lua, opts: Value| {
+        let (target, empty_only) = match &opts {
+            Value::Nil => (None, false),
+            Value::Table(_) => {
+                let parsed: DestroyOpts = lua.from_value(opts)?;
+                let target = optional_desktop_target(
+                    parsed.direction.as_deref(),
+                    parsed.number,
+                    parsed.space_id,
+                    parsed.display,
+                )?;
+                (target, parsed.empty_only.unwrap_or(false))
+            }
+            _ => (
+                Some(parse_scalar_desktop_target(&opts, "desktop.destroy")?),
+                false,
+            ),
+        };
+        dispatch(
+            lua,
+            Command::Desktop(DesktopOperation::Destroy { target, empty_only }),
+        )
+    })
+}
+
+fn desktop_pin_verb(lua: &Lua, dispatch: &Dispatch) -> Result<Function> {
+    let dispatch = Rc::clone(dispatch);
+    lua.create_function(move |lua, opts: Value| {
+        let pin = match &opts {
+            Value::Nil => DesktopPinTarget::All,
+            Value::String(s) if s.to_str()? == "all" => DesktopPinTarget::All,
+            Value::Table(_) => {
+                let parsed: PinOpts = lua.from_value(opts)?;
+                let target = optional_desktop_target(
+                    parsed.direction.as_deref(),
+                    parsed.number,
+                    parsed.space_id,
+                    parsed.display,
+                )?;
+                match parsed.mode.as_deref() {
+                    Some("all") if target.is_none() => DesktopPinTarget::All,
+                    Some("all") => {
+                        return Err(mlua::Error::RuntimeError(
+                            "desktop.pin: mode = 'all' cannot be combined with a target".into(),
+                        ));
+                    }
+                    Some(other) => {
+                        return Err(mlua::Error::RuntimeError(format!(
+                            "desktop.pin: unknown mode '{other}'"
+                        )));
+                    }
+                    None => DesktopPinTarget::Desktop(target.ok_or_else(|| {
+                        mlua::Error::RuntimeError(
+                            "desktop.pin expects 'all', a desktop number, direction, or options table"
+                                .into(),
+                        )
+                    })?),
+                }
+            }
+            _ => DesktopPinTarget::Desktop(parse_scalar_desktop_target(&opts, "desktop.pin")?),
+        };
+        dispatch(lua, Command::Desktop(DesktopOperation::Pin(pin)))
+    })
+}
+
+fn desktop_assign_verb(lua: &Lua, dispatch: &Dispatch) -> Result<Function> {
+    let dispatch = Rc::clone(dispatch);
+    lua.create_function(move |lua, opts: Value| {
+        let (target, pid) = match &opts {
+            Value::String(s) => {
+                let s = s.to_str()?;
+                let target = if let Some(mode) = DesktopAssignTarget::parse_mode(&s) {
+                    mode
+                } else {
+                    DesktopAssignTarget::Desktop(DesktopTarget::Direction {
+                        direction: Direction::parse(&s)
+                            .map_err(|err| mlua::Error::RuntimeError(err.to_string()))?,
+                        display: None,
+                    })
+                };
+                (target, None)
+            }
+            Value::Table(_) => {
+                let parsed: AssignOpts = lua.from_value(opts)?;
+                if let Some(p) = parsed.pid
+                    && p <= 0
+                {
+                    return Err(mlua::Error::RuntimeError(
+                        "desktop.assign: pid must be positive".into(),
+                    ));
+                }
+                let desktop_target = optional_desktop_target(
+                    parsed.direction.as_deref(),
+                    parsed.number,
+                    parsed.space_id,
+                    parsed.display,
+                )?;
+                let target = match parsed.mode.as_deref() {
+                    Some(mode) => {
+                        if desktop_target.is_some() {
+                            return Err(mlua::Error::RuntimeError(
+                                "desktop.assign: mode cannot be combined with a target".into(),
+                            ));
+                        }
+                        DesktopAssignTarget::parse_mode(mode).ok_or_else(|| {
+                            mlua::Error::RuntimeError(format!(
+                                "desktop.assign: unknown mode '{mode}'"
+                            ))
+                        })?
+                    }
+                    None => DesktopAssignTarget::Desktop(desktop_target.ok_or_else(|| {
+                        mlua::Error::RuntimeError(
+                            "desktop.assign expects mode or a desktop target".into(),
+                        )
+                    })?),
+                };
+                (target, parsed.pid)
+            }
+            _ => (
+                DesktopAssignTarget::Desktop(parse_scalar_desktop_target(&opts, "desktop.assign")?),
+                None,
+            ),
+        };
+        dispatch(
+            lua,
+            Command::Desktop(DesktopOperation::Assign { target, pid }),
+        )
+    })
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct DesktopTargetOpts {
+    direction: Option<String>,
+    number: Option<u32>,
+    space_id: Option<u64>,
+    display: Option<u32>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct MoveWindowOpts {
+    direction: Option<String>,
+    number: Option<u32>,
+    space_id: Option<u64>,
+    display: Option<u32>,
+    follow: Option<bool>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct DestroyOpts {
+    direction: Option<String>,
+    number: Option<u32>,
+    space_id: Option<u64>,
+    display: Option<u32>,
+    empty_only: Option<bool>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct PinOpts {
+    direction: Option<String>,
+    number: Option<u32>,
+    space_id: Option<u64>,
+    display: Option<u32>,
+    mode: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct AssignOpts {
+    direction: Option<String>,
+    number: Option<u32>,
+    space_id: Option<u64>,
+    display: Option<u32>,
+    mode: Option<String>,
+    pid: Option<i32>,
+}
+
+fn parse_scalar_desktop_target(value: &Value, what: &str) -> Result<DesktopTarget> {
+    match value {
+        Value::Integer(n) => {
+            let number = u32::try_from(*n)
+                .ok()
+                .filter(|&v| v >= 1)
+                .ok_or_else(|| mlua::Error::RuntimeError("desktop numbers start at 1".into()))?;
+            Ok(DesktopTarget::Number {
+                number,
+                display: None,
+            })
+        }
+        Value::Number(f) => {
+            if !f.is_finite() || *f < 1.0 || f.fract() != 0.0 || *f > f64::from(u32::MAX) {
+                return Err(mlua::Error::RuntimeError(
+                    "desktop numbers must be positive integers".into(),
+                ));
+            }
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            Ok(DesktopTarget::Number {
+                number: *f as u32,
+                display: None,
+            })
+        }
+        Value::String(s) => {
+            let direction = Direction::parse(&s.to_str()?)
+                .map_err(|err| mlua::Error::RuntimeError(err.to_string()))?;
+            Ok(DesktopTarget::Direction {
+                direction,
+                display: None,
+            })
+        }
+        Value::Nil => Err(mlua::Error::RuntimeError(format!(
+            "{what} expects a desktop number, direction, or {{ number/direction/space_id = ... }}"
+        ))),
+        other => Err(mlua::Error::RuntimeError(format!(
+            "{what}: expected desktop number, direction string, or options table, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+fn optional_desktop_target(
+    direction: Option<&str>,
+    number: Option<u32>,
+    space_id: Option<u64>,
+    display: Option<u32>,
+) -> Result<Option<DesktopTarget>> {
+    let count = usize::from(space_id.is_some())
+        + usize::from(number.is_some())
+        + usize::from(direction.is_some());
+    if count > 1 {
+        return Err(mlua::Error::RuntimeError(
+            "specify at most one of number, direction, or space_id".into(),
+        ));
+    }
+    if let Some(sid) = space_id {
+        if sid == 0 {
+            return Err(mlua::Error::RuntimeError("space_id must be >= 1".into()));
+        }
+        if display.is_some() {
+            return Err(mlua::Error::RuntimeError(
+                "space_id cannot be combined with display".into(),
+            ));
+        }
+        return Ok(Some(DesktopTarget::SpaceId(sid)));
+    }
+    if let Some(num) = number {
+        if num == 0 {
+            return Err(mlua::Error::RuntimeError(
+                "desktop numbers start at 1".into(),
+            ));
+        }
+        return Ok(Some(DesktopTarget::Number {
+            number: num,
+            display,
+        }));
+    }
+    if let Some(dir_str) = direction {
+        let direction =
+            Direction::parse(dir_str).map_err(|err| mlua::Error::RuntimeError(err.to_string()))?;
+        return Ok(Some(DesktopTarget::Direction { direction, display }));
+    }
+    if display.is_some() {
+        return Err(mlua::Error::RuntimeError(
+            "display requires number or direction".into(),
+        ));
+    }
+    Ok(None)
+}
+
+fn require_desktop_target(
+    what: &str,
+    direction: Option<&str>,
+    number: Option<u32>,
+    space_id: Option<u64>,
+    display: Option<u32>,
+) -> Result<DesktopTarget> {
+    optional_desktop_target(direction, number, space_id, display)?.ok_or_else(|| {
+        mlua::Error::RuntimeError(format!(
+            "{what} expects a desktop number, direction, or {{ number/direction/space_id = ... }}"
+        ))
+    })
+}
+
+/// Virtual-workspace verbs come in two shapes: a position selects a numbered
+/// workspace, a direction cycles through them.
+fn virtual_operation(
+    direction: Direction,
+    numbered: impl Fn(u32) -> Operation,
+    directional: impl Fn(Direction) -> Operation,
+) -> Result<Operation> {
+    match direction {
+        Direction::Nth(index) => u32::try_from(index)
+            .map(&numbered)
+            .map_err(|_| mlua::Error::RuntimeError("workspace number is too large".into())),
+        direction => Ok(directional(direction)),
+    }
+}
+
+/// A zero-argument verb issuing a fixed command.
+fn verb(lua: &Lua, dispatch: &Dispatch, command: Command) -> Result<Function> {
+    let dispatch = Rc::clone(dispatch);
+    lua.create_function(move |lua, ()| dispatch(lua, command.clone()))
+}
+
+/// A verb taking `{ direction = "east" }` or `{ number = 3 }` (or the bare
+/// value), e.g. `paneru.window.focus{ number = 3 }`.
+fn directional(
+    lua: &Lua,
+    dispatch: &Dispatch,
+    what: &'static str,
+    operation: impl Fn(Direction) -> Operation + 'static,
+) -> Result<Function> {
+    let dispatch = Rc::clone(dispatch);
+    lua.create_function(move |lua, opts: Value| {
+        let direction = Opts::read(lua, &opts)?.target(what)?;
+        dispatch(lua, Command::Window(operation(direction)))
+    })
+}
+
+/// A verb taking `{ follow = false }`, defaulting to following the window.
+fn follower(
+    lua: &Lua,
+    dispatch: &Dispatch,
+    operation: impl Fn(MoveFocus) -> Operation + 'static,
+) -> Result<Function> {
+    let dispatch = Rc::clone(dispatch);
+    lua.create_function(move |lua, opts: Value| {
+        let follow = Opts::read(lua, &opts)?.follow();
+        dispatch(lua, Command::Window(operation(follow)))
+    })
+}
+
+/// `paneru.window.resize{ direction = "grow" }`, defaulting to growing.
+fn resize(lua: &Lua, dispatch: &Dispatch) -> Result<Function> {
+    let dispatch = Rc::clone(dispatch);
+    lua.create_function(move |lua, opts: Value| {
+        let direction = ResizeOpts::read(lua, &opts)?;
+        dispatch(lua, Command::Window(Operation::Resize(direction)))
+    })
+}
+
+/// `paneru.window.vertical_resize{ direction = "grow" }`, the height sibling of
+/// [`resize`], also defaulting to growing.
+fn vertical_resize(lua: &Lua, dispatch: &Dispatch) -> Result<Function> {
+    let dispatch = Rc::clone(dispatch);
+    lua.create_function(move |lua, opts: Value| {
+        let direction = ResizeOpts::read(lua, &opts)?;
+        dispatch(lua, Command::Window(Operation::ResizeVertical(direction)))
+    })
+}
+
+/// The options every verb accepts: `{ direction = "east" }`, `{ number = 3 }`,
+/// `{ follow = false }`, or the bare `"east"` / `3`.
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct Opts {
+    direction: Option<Direction>,
+    number: Option<Direction>,
+    follow: Option<bool>,
+}
+
+impl Opts {
+    /// Reads the options off a call argument. A bare scalar is the direction.
+    fn read(lua: &Lua, value: &Value) -> Result<Self> {
+        match value {
+            Value::Nil => Ok(Self::default()),
+            Value::Table(_) => lua.from_value(value.clone()),
+            bare => Ok(Self {
+                direction: Some(lua.from_value(bare.clone())?),
+                ..Self::default()
+            }),
+        }
+    }
+
+    /// The target of a directional verb; `what` names it in the error.
+    fn target(self, what: &str) -> Result<Direction> {
+        self.direction.or(self.number).ok_or_else(|| {
+            mlua::Error::RuntimeError(format!(
+                "{what} expects {{ direction = ... }} or {{ number = ... }}"
+            ))
+        })
+    }
+
+    /// Whether the focus follows a moved window. Following is the default.
+    fn follow(&self) -> MoveFocus {
+        MoveFocus::follows(self.follow.unwrap_or(true))
+    }
+}
+
+/// `paneru.window.resize` options: `{ direction = "grow" }` or a bare
+/// `"shrink"`, defaulting to growing.
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ResizeOpts {
+    direction: Option<ResizeDirection>,
+}
+
+impl ResizeOpts {
+    fn read(lua: &Lua, value: &Value) -> Result<ResizeDirection> {
+        let direction = match value {
+            Value::Nil => None,
+            Value::Table(_) => lua.from_value::<Self>(value.clone())?.direction,
+            bare => Some(lua.from_value(bare.clone())?),
+        };
+        Ok(direction.unwrap_or(ResizeDirection::Grow))
+    }
+}
+
+/// Converts a `paneru.run` argument into a [`Command`]: a command string, an
+/// argv table, or a structured table deserialized straight into the enums.
+fn to_command(lua: &Lua, value: &Value) -> Result<Command> {
+    let parse = |argv: &[String]| {
+        let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
+        parse_command(&borrowed).map_err(|err| mlua::Error::RuntimeError(err.to_string()))
+    };
+
+    match value {
+        Value::String(command) => {
+            let command = command.to_str()?;
+            let argv: Vec<String> = command.split_whitespace().map(str::to_string).collect();
+            if argv.is_empty() {
+                return Err(mlua::Error::RuntimeError("empty command".into()));
+            }
+            parse(&argv)
+        }
+        // A sequence is argv (`{"window", "focus", "east"}`); any other table is
+        // a structured command (`{ window = { focus = "east" } }`).
+        Value::Table(table) if table.raw_len() > 0 => {
+            let argv: Vec<String> = table
+                .clone()
+                .sequence_values::<Value>()
+                .map(|entry| scalar_token(&entry?))
+                .collect::<Result<_>>()?;
+            parse(&argv)
+        }
+        Value::Table(_) => lua.from_value(value.clone()),
+        other => Err(mlua::Error::RuntimeError(format!(
+            "command must be a string, argv table or command table, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// Stringifies an argv element (integers without a decimal point, so `3` becomes
+/// `"3"` and not `"3.0"`).
+fn scalar_token(value: &Value) -> Result<String> {
+    match value {
+        Value::String(string) => Ok(string.to_str()?.to_string()),
+        Value::Integer(number) => Ok(number.to_string()),
+        Value::Number(number) => Ok(format!("{number}")),
+        other => Err(mlua::Error::RuntimeError(format!(
+            "command arguments must be strings or numbers, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// The loadable-module entry point: `require("paneru")` calls `luaopen_paneru`,
+/// which returns the client table. Only compiled for the `module` feature —
+/// the daemon depends on this crate as a plain library.
+#[cfg(feature = "module")]
+#[mlua::lua_module]
+fn paneru(lua: &Lua) -> Result<Table> {
+    super::client::module(lua, env!("CARGO_PKG_VERSION"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    /// Installs the API with a dispatcher that records commands instead of
+    /// issuing them, and runs `source`.
+    fn run(source: &str) -> mlua::Result<Vec<Command>> {
+        let lua = Lua::new();
+        let issued = Rc::new(RefCell::new(Vec::new()));
+        let paneru = lua.create_table()?;
+        lua.globals().set("paneru", paneru.clone())?;
+
+        let recorder = {
+            let issued = Rc::clone(&issued);
+            move |_: &Lua, command: Command| {
+                issued.borrow_mut().push(command);
+                Ok(true)
+            }
+        };
+        install(&lua, &paneru, &(Rc::new(recorder) as Dispatch))?;
+        lua.load(source).exec()?;
+
+        let commands = issued.borrow().clone();
+        Ok(commands)
+    }
+
+    fn debug(commands: &[Command]) -> Vec<String> {
+        commands.iter().map(|c| format!("{c:?}")).collect()
+    }
+
+    #[test]
+    fn typed_verbs_build_typed_commands() {
+        let commands = run(r#"
+            paneru.window.focus({ direction = "east" })
+            paneru.window.focus({ number = 3 })
+            paneru.window.balance()
+            paneru.showmenu()
+            paneru.hidemenu()
+            paneru.overview()
+            paneru.workspace.move_window({ number = 2, follow = false })
+        "#)
+        .unwrap();
+
+        assert_eq!(
+            debug(&commands),
+            debug(&[
+                Command::Window(Operation::Focus(Direction::East)),
+                Command::Window(Operation::Focus(Direction::Nth(2))),
+                Command::Window(Operation::Balance),
+                Command::MenuBar(true),
+                Command::MenuBar(false),
+                Command::Overview,
+                Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
+            ])
+        );
+    }
+
+    #[test]
+    fn run_accepts_strings_argv_and_command_tables() {
+        let commands = run(r#"
+            paneru.run("window focus east")
+            paneru.run({ "window", "focus", 3 })
+            paneru.run({ window = { focus = "east" } })
+        "#)
+        .unwrap();
+
+        assert_eq!(
+            debug(&commands),
+            debug(&[
+                Command::Window(Operation::Focus(Direction::East)),
+                Command::Window(Operation::Focus(Direction::Nth(2))),
+                Command::Window(Operation::Focus(Direction::East)),
+            ])
+        );
+    }
+
+    #[test]
+    fn bad_arguments_fail_at_the_call_site() {
+        assert!(run(r#"paneru.window.focus({ direction = "sideways" })"#).is_err());
+        assert!(run("paneru.window.focus({})").is_err());
+        assert!(run(r#"paneru.window.resize({ direction = "wider" })"#).is_err());
+        assert!(run(r#"paneru.window.vertical_resize({ direction = "taller" })"#).is_err());
+        assert!(run(r#"paneru.run("not a command")"#).is_err());
+    }
+
+    #[test]
+    fn defaults_match_the_documented_behaviour() {
+        let commands = run(r#"
+            paneru.window.resize()
+            paneru.window.vertical_resize()
+            paneru.window.vertical_resize("shrink")
+            paneru.window.next_display()
+            paneru.window.next_display({ follow = false })
+        "#)
+        .unwrap();
+
+        assert_eq!(
+            debug(&commands),
+            debug(&[
+                Command::Window(Operation::Resize(ResizeDirection::Grow)),
+                Command::Window(Operation::ResizeVertical(ResizeDirection::Grow)),
+                Command::Window(Operation::ResizeVertical(ResizeDirection::Shrink)),
+                Command::Window(Operation::ToNextDisplay(MoveFocus::Follow)),
+                Command::Window(Operation::ToNextDisplay(MoveFocus::Stay)),
+            ])
+        );
+    }
+
+    #[test]
+    fn desktop_navigation_and_lifecycle_verbs_build_typed_commands() {
+        let commands = run(r#"
+            paneru.desktop.focus("east")
+            paneru.desktop.focus(2)
+            paneru.desktop.focus({ number = 3, display = 2 })
+            paneru.desktop.focus({ space_id = 42 })
+            paneru.desktop.move_window({ number = 2, follow = true })
+            paneru.desktop.send_window("west")
+            paneru.desktop.create()
+            paneru.desktop.create({ focus = true })
+            paneru.desktop.destroy()
+            paneru.desktop.destroy({ number = 2, empty_only = true })
+            paneru.desktop.reorder("east")
+            paneru.desktop.swap(1)
+        "#)
+        .unwrap();
+
+        assert_eq!(
+            debug(&commands),
+            debug(&[
+                Command::Desktop(DesktopOperation::Focus(DesktopTarget::Direction {
+                    direction: Direction::East,
+                    display: None,
+                })),
+                Command::Desktop(DesktopOperation::Focus(DesktopTarget::Number {
+                    number: 2,
+                    display: None,
+                })),
+                Command::Desktop(DesktopOperation::Focus(DesktopTarget::Number {
+                    number: 3,
+                    display: Some(2),
+                })),
+                Command::Desktop(DesktopOperation::Focus(DesktopTarget::SpaceId(42))),
+                Command::Desktop(DesktopOperation::MoveWindow {
+                    target: DesktopTarget::Number {
+                        number: 2,
+                        display: None,
+                    },
+                    move_focus: MoveFocus::Follow,
+                }),
+                Command::Desktop(DesktopOperation::MoveWindow {
+                    target: DesktopTarget::Direction {
+                        direction: Direction::West,
+                        display: None,
+                    },
+                    move_focus: MoveFocus::Stay,
+                }),
+                Command::Desktop(DesktopOperation::Create { focus: false }),
+                Command::Desktop(DesktopOperation::Create { focus: true }),
+                Command::Desktop(DesktopOperation::Destroy {
+                    target: None,
+                    empty_only: false,
+                }),
+                Command::Desktop(DesktopOperation::Destroy {
+                    target: Some(DesktopTarget::Number {
+                        number: 2,
+                        display: None,
+                    }),
+                    empty_only: true,
+                }),
+                Command::Desktop(DesktopOperation::Reorder(DesktopTarget::Direction {
+                    direction: Direction::East,
+                    display: None,
+                })),
+                Command::Desktop(DesktopOperation::Swap(DesktopTarget::Number {
+                    number: 1,
+                    display: None,
+                })),
+            ])
+        );
+    }
+
+    #[test]
+    fn desktop_pin_and_assign_verbs_build_typed_commands() {
+        let commands = run(r#"
+            paneru.desktop.pin("all")
+            paneru.desktop.pin(2)
+            paneru.desktop.unpin()
+            paneru.desktop.assign("all")
+            paneru.desktop.assign("none")
+            paneru.desktop.assign({ number = 2, pid = 777 })
+        "#)
+        .unwrap();
+
+        assert_eq!(
+            debug(&commands),
+            debug(&[
+                Command::Desktop(DesktopOperation::Pin(DesktopPinTarget::All)),
+                Command::Desktop(DesktopOperation::Pin(DesktopPinTarget::Desktop(
+                    DesktopTarget::Number {
+                        number: 2,
+                        display: None,
+                    },
+                ))),
+                Command::Desktop(DesktopOperation::Unpin),
+                Command::Desktop(DesktopOperation::Assign {
+                    target: DesktopAssignTarget::All,
+                    pid: None,
+                }),
+                Command::Desktop(DesktopOperation::Assign {
+                    target: DesktopAssignTarget::None,
+                    pid: None,
+                }),
+                Command::Desktop(DesktopOperation::Assign {
+                    target: DesktopAssignTarget::Desktop(DesktopTarget::Number {
+                        number: 2,
+                        display: None,
+                    }),
+                    pid: Some(777),
+                }),
+            ])
+        );
+
+        assert!(run("paneru.desktop.focus(0)").is_err());
+        assert!(run("paneru.desktop.focus({})").is_err());
+        assert!(run(r#"paneru.desktop.focus("sideways")"#).is_err());
+        assert!(run("paneru.desktop.focus({ number = 2, follow = false })").is_err());
+        assert!(run("paneru.desktop.focus({ space_id = 42, display = 2 })").is_err());
+        assert!(run("paneru.desktop.focus({ number = 2, direction = 'east' })").is_err());
+        assert!(run("paneru.desktop.send_window({ number = 2, follow = true })").is_err());
+        assert!(run("paneru.desktop.destroy({ display = 2 })").is_err());
+        assert!(run("paneru.desktop.pin({ mode = 'bogus', number = 2 })").is_err());
+        assert!(run("paneru.desktop.pin({ mode = 'all', number = 2 })").is_err());
+        assert!(run("paneru.desktop.assign({ mode = 'bogus' })").is_err());
+        assert!(run("paneru.desktop.assign({ mode = 'all', number = 2 })").is_err());
+        assert!(run("paneru.desktop.assign({ mode = 'all', pid = 0 })").is_err());
+    }
+}
