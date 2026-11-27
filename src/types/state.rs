@@ -17,6 +17,8 @@ pub enum StateQueryKind {
     State,
     /// Just the virtual workspace rows.
     VirtualWorkspaces,
+    /// Just the native macOS Spaces / Desktops across displays.
+    Desktops,
     /// Just the active display/workspace/focus state.
     Active,
     /// Just the windows currently visible on screen.
@@ -25,9 +27,10 @@ pub enum StateQueryKind {
 
 impl StateQueryKind {
     /// Every query kind, in the order the CLI lists them.
-    pub const ALL: [StateQueryKind; 4] = [
+    pub const ALL: [StateQueryKind; 5] = [
         StateQueryKind::State,
         StateQueryKind::VirtualWorkspaces,
+        StateQueryKind::Desktops,
         StateQueryKind::Active,
         StateQueryKind::OnScreen,
     ];
@@ -36,10 +39,11 @@ impl StateQueryKind {
     /// paired with the kind it queries. Both Lua hosts (the embedded runtime and
     /// the loadable client module) iterate this so the shorthand name and the
     /// kind it maps to are defined exactly once.
-    pub const SHORTHANDS: [(&'static str, StateQueryKind); 4] = [
+    pub const SHORTHANDS: [(&'static str, StateQueryKind); 5] = [
         ("query_state", StateQueryKind::State),
         ("query_active", StateQueryKind::Active),
         ("query_workspaces", StateQueryKind::VirtualWorkspaces),
+        ("query_desktops", StateQueryKind::Desktops),
         ("query_on_screen", StateQueryKind::OnScreen),
     ];
 
@@ -49,6 +53,7 @@ impl StateQueryKind {
         match self {
             StateQueryKind::State => "state",
             StateQueryKind::VirtualWorkspaces => "virtual-workspaces",
+            StateQueryKind::Desktops => "desktops",
             StateQueryKind::Active => "active",
             StateQueryKind::OnScreen => "on-screen",
         }
@@ -78,6 +83,31 @@ pub struct QueryState {
     pub timestamp: u64,
     pub active: ActiveState,
     pub virtual_workspaces: Vec<VirtualWorkspaceState>,
+    #[serde(default)]
+    pub desktops: Vec<DesktopState>,
+}
+
+/// Classification of a native macOS Space in [`DesktopState`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopKindState {
+    Desktop,
+    Fullscreen,
+    Other(i32),
+}
+
+/// One native macOS Space / Desktop in `SLSCopyManagedDisplaySpaces` order.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesktopState {
+    pub space_id: u64,
+    pub uuid: String,
+    pub display_id: u32,
+    /// 1-based Desktop number on `display_id` for ordinary Desktops (`None` for Fullscreen).
+    pub number: Option<u32>,
+    /// 0-based Space index within `display_id` across all managed Spaces.
+    pub space_index: u32,
+    pub kind: DesktopKindState,
+    pub active: bool,
 }
 
 /// The active display, workspace and focused window.
@@ -85,6 +115,8 @@ pub struct QueryState {
 pub struct ActiveState {
     pub display_id: Option<u32>,
     pub native_workspace_id: Option<u64>,
+    #[serde(default)]
+    pub desktop_number: Option<u32>,
     pub virtual_workspace_number: Option<u32>,
     pub focused_window_id: Option<i32>,
     pub focused_bundle_id: Option<String>,
@@ -98,6 +130,11 @@ pub struct VirtualWorkspaceState {
     pub number: u32,
     pub native_workspace_id: u64,
     pub active: bool,
+    /// Whether this is the row its space shows: the active workspace, or on
+    /// a space without OS focus, the one selected there. At most one row per
+    /// `native_workspace_id` is shown.
+    #[serde(default)]
+    pub shown: bool,
     pub windows: Vec<WindowState>,
 }
 
@@ -111,12 +148,18 @@ pub struct Frame {
 }
 
 /// A window, as reported by queries and subscription events.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct WindowState {
     pub window_id: i32,
     pub bundle_id: String,
     pub app_name: String,
     pub title: String,
+    /// Accessibility role (e.g. `AXWindow`), when the window reports one.
+    pub role: Option<String>,
+    /// Accessibility subrole (e.g. `AXStandardWindow`, `AXDialog`), when the
+    /// window reports one.
+    pub subrole: Option<String>,
     pub focused: bool,
     pub floating: bool,
     /// Display the window is (mostly) on, when it overlaps one at all.
@@ -127,6 +170,17 @@ pub struct WindowState {
     /// hidden, and showing more than the sliver Paneru leaves poking out for
     /// off-screen windows.
     pub visible: bool,
+    /// Zero-based column of a tiled window in its strip, left to right; `None`
+    /// for floating windows.
+    pub column: Option<u32>,
+    /// Zero-based row of a tiled window within its column, top to bottom.
+    /// Windows tabbed together share a row.
+    pub row: Option<u32>,
+    /// Whether the window's stack is shown as tabs (`window tabbeddisplay`):
+    /// its windows share one frame, though each keeps its own row. Missing
+    /// from a daemon that predates it.
+    #[serde(default)]
+    pub tabbed: bool,
 }
 
 impl QueryState {
@@ -161,6 +215,7 @@ impl QueryState {
         match kind {
             StateQueryKind::State => serde_json::to_string(self),
             StateQueryKind::VirtualWorkspaces => serde_json::to_string(&self.virtual_workspaces),
+            StateQueryKind::Desktops => serde_json::to_string(&self.desktops),
             StateQueryKind::Active => serde_json::to_string(&self.active),
             StateQueryKind::OnScreen => serde_json::to_string(&self.on_screen()),
         }
@@ -169,18 +224,33 @@ impl QueryState {
     /// The same slice as [`Self::to_query_json`], typed for the wire.
     ///
     /// This is what actually crosses between processes; the two JSON spellings
-    /// above are for a terminal and for the embedded Lua runtime.
+    /// above are for a terminal and for the embedded Lua runtime. Takes `self`
+    /// by value so wire replies move fields out without cloning.
     #[must_use]
-    pub fn to_query_payload(&self, kind: StateQueryKind) -> crate::wire::QueryPayload {
-        use crate::wire::QueryPayload;
+    pub fn into_query_payload(self, kind: StateQueryKind) -> crate::types::wire::QueryPayload {
+        use crate::types::wire::QueryPayload;
         match kind {
-            StateQueryKind::State => QueryPayload::State(Box::new(self.clone())),
+            StateQueryKind::State => QueryPayload::State(Box::new(self)),
             StateQueryKind::VirtualWorkspaces => {
-                QueryPayload::VirtualWorkspaces(self.virtual_workspaces.clone())
+                QueryPayload::VirtualWorkspaces(self.virtual_workspaces)
             }
-            StateQueryKind::Active => QueryPayload::Active(Box::new(self.active.clone())),
+            StateQueryKind::Desktops => QueryPayload::Desktops(self.desktops),
+            StateQueryKind::Active => QueryPayload::Active(Box::new(self.active)),
             StateQueryKind::OnScreen => {
-                QueryPayload::OnScreen(self.on_screen().into_iter().cloned().collect())
+                let mut on_screen: Vec<WindowState> = self
+                    .virtual_workspaces
+                    .into_iter()
+                    .flat_map(|workspace| workspace.windows)
+                    .filter(|window| window.visible)
+                    .collect();
+                on_screen.sort_by_key(|window| {
+                    (
+                        window.display_id,
+                        window.frame.map(|frame| frame.x),
+                        window.window_id,
+                    )
+                });
+                QueryPayload::OnScreen(on_screen)
             }
         }
     }
@@ -198,6 +268,7 @@ impl QueryState {
         match kind {
             StateQueryKind::State => serde_json::to_value(self),
             StateQueryKind::VirtualWorkspaces => serde_json::to_value(&self.virtual_workspaces),
+            StateQueryKind::Desktops => serde_json::to_value(&self.desktops),
             StateQueryKind::Active => serde_json::to_value(&self.active),
             StateQueryKind::OnScreen => serde_json::to_value(self.on_screen()),
         }
@@ -237,6 +308,11 @@ pub enum StateEvent {
     /// Display configuration changed. `display_id` is `null` for a global
     /// change Paneru cannot pin to one display.
     DisplayChanged { display_id: Option<u32> },
+    /// Native macOS Desktops changed (active Space switch, create, destroy, or reorder).
+    DesktopsChanged {
+        desktops: Vec<DesktopState>,
+        active: ActiveState,
+    },
 }
 
 impl StateEvent {
@@ -247,7 +323,7 @@ impl StateEvent {
     /// If serialization fails, which should not happen barring a bug in this
     /// type's `Serialize` impl.
     pub fn to_json(&self) -> serde_json::Result<serde_json::Value> {
-        Ok(crate::json::flatten_tag(
+        Ok(crate::types::json::flatten_tag(
             serde_json::to_value(self)?,
             "event",
         ))
@@ -257,16 +333,11 @@ impl StateEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::{Codec, MessagePack};
+    use crate::types::wire::{Codec, MessagePack};
 
     #[test]
     fn query_kinds_round_trip_through_their_tokens() {
-        for kind in [
-            StateQueryKind::State,
-            StateQueryKind::VirtualWorkspaces,
-            StateQueryKind::Active,
-            StateQueryKind::OnScreen,
-        ] {
+        for kind in StateQueryKind::ALL {
             assert_eq!(StateQueryKind::parse(kind.token()), Some(kind));
         }
         assert_eq!(StateQueryKind::parse("nonsense"), None);
@@ -280,6 +351,8 @@ mod tests {
                 bundle_id: "com.example.app".into(),
                 app_name: "Example".into(),
                 title: "window".into(),
+                role: Some("AXWindow".into()),
+                subrole: Some("AXStandardWindow".into()),
                 focused: true,
                 floating: false,
                 display_id: Some(1),
@@ -290,6 +363,9 @@ mod tests {
                     height: 600,
                 }),
                 visible: true,
+                column: Some(0),
+                row: Some(0),
+                tabbed: false,
             }],
             active: ActiveState::default(),
         };
@@ -306,6 +382,49 @@ mod tests {
         );
     }
 
+    /// A daemon from before `role`/`subrole` existed omits them; a newer client
+    /// must still decode its windows, over both JSON and `MessagePack`.
+    #[test]
+    fn window_state_without_role_fields_decodes_as_none() {
+        #[derive(Serialize)]
+        struct OldWindowState {
+            window_id: i32,
+            bundle_id: String,
+            app_name: String,
+            title: String,
+            focused: bool,
+            floating: bool,
+            display_id: Option<u32>,
+            frame: Option<Frame>,
+            visible: bool,
+        }
+        let old = OldWindowState {
+            window_id: 1,
+            bundle_id: "com.example.app".into(),
+            app_name: "Example".into(),
+            title: "window".into(),
+            focused: true,
+            floating: false,
+            display_id: Some(1),
+            frame: None,
+            visible: true,
+        };
+
+        let from_json: WindowState =
+            serde_json::from_str(&serde_json::to_string(&old).unwrap()).unwrap();
+        let from_msgpack: WindowState = MessagePack
+            .decode(&MessagePack.encode(&old).unwrap())
+            .unwrap();
+
+        for window in [from_json, from_msgpack] {
+            assert_eq!(window.window_id, 1);
+            assert_eq!(window.title, "window");
+            assert_eq!(window.role, None);
+            assert_eq!(window.subrole, None);
+            assert!(!window.tabbed);
+        }
+    }
+
     #[test]
     fn on_screen_is_the_visible_subset_ordered_left_to_right() {
         let window = |window_id, x, visible| WindowState {
@@ -313,6 +432,8 @@ mod tests {
             bundle_id: String::new(),
             app_name: String::new(),
             title: String::new(),
+            role: None,
+            subrole: None,
             focused: false,
             floating: false,
             display_id: Some(1),
@@ -323,6 +444,9 @@ mod tests {
                 height: 100,
             }),
             visible,
+            column: None,
+            row: None,
+            tabbed: false,
         };
 
         let state = QueryState {
@@ -333,12 +457,14 @@ mod tests {
                 number: 1,
                 native_workspace_id: 1,
                 active: true,
+                shown: true,
                 windows: vec![
                     window(1, 500, true),
                     window(2, 0, false),
                     window(3, 100, true),
                 ],
             }],
+            desktops: Vec::new(),
         };
 
         let visible: Vec<i32> = state

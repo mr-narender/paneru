@@ -76,13 +76,15 @@ pub fn bind<T: DeserializeOwned>(service: &str) -> Result<Receiver<T>> {
     async_mach_ports::Receiver::bind(service, MessagePack)
 }
 
-use crate::commands::Command;
-pub use crate::script_state::WriteOutcome;
+use crate::types::commands::Command;
+pub use crate::types::script_state::WriteOutcome;
 
-use crate::script_state::ScriptStateWrite;
-use crate::script_value::ScriptValue;
-use crate::state::{ActiveState, QueryState, StateQueryKind, VirtualWorkspaceState, WindowState};
-use crate::windowset::{LayoutOp, WindowSet};
+use crate::types::script_state::ScriptStateWrite;
+use crate::types::script_value::ScriptValue;
+use crate::types::state::{
+    ActiveState, DesktopState, QueryState, StateQueryKind, VirtualWorkspaceState, WindowState,
+};
+use crate::types::windowset::{LayoutOp, WindowSet};
 
 /// Something a client asks the daemon to do.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -131,6 +133,7 @@ pub enum Response {
 pub enum QueryPayload {
     State(Box<QueryState>),
     VirtualWorkspaces(Vec<VirtualWorkspaceState>),
+    Desktops(Vec<DesktopState>),
     Active(Box<ActiveState>),
     OnScreen(Vec<WindowState>),
 }
@@ -146,6 +149,7 @@ impl QueryPayload {
         match self {
             Self::State(state) => serde_json::to_value(state),
             Self::VirtualWorkspaces(rows) => serde_json::to_value(rows),
+            Self::Desktops(desktops) => serde_json::to_value(desktops),
             Self::Active(active) => serde_json::to_value(active),
             Self::OnScreen(windows) => serde_json::to_value(windows),
         }
@@ -164,8 +168,8 @@ pub enum ScriptStateResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::{Command, Direction, Operation};
-    use crate::state::Frame;
+    use crate::types::commands::{Command, Direction, Operation};
+    use crate::types::state::Frame;
     use std::sync::Arc;
 
     fn round_trip<T>(value: &T)
@@ -183,6 +187,7 @@ mod tests {
             Direction::East,
         ))));
         round_trip(&Request::Query(StateQueryKind::Active));
+        round_trip(&Request::Query(StateQueryKind::Desktops));
         round_trip(&Request::WindowSet);
         round_trip(&Request::WindowSetApply(vec![LayoutOp::Focus(7)]));
         round_trip(&Request::Subscribe);
@@ -200,6 +205,7 @@ mod tests {
         round_trip(&Response::Query(
             QueryPayload::VirtualWorkspaces(Vec::new()),
         ));
+        round_trip(&Response::Query(QueryPayload::Desktops(Vec::new())));
         round_trip(&Response::Query(QueryPayload::OnScreen(Vec::new())));
         round_trip(&Response::ScriptState(ScriptStateResponse::Value(Some(
             ScriptValue::Str("hello".to_string()),
@@ -214,13 +220,15 @@ mod tests {
     /// a client actually transforms, so it gets its own round trip.
     #[test]
     fn the_window_set_survives_the_wire() {
-        use crate::windowset::{ColumnSet, DisplaySet, WindowRec, WorkspaceSet};
+        use crate::types::windowset::{ColumnSet, DisplaySet, WindowRec, WorkspaceSet};
 
         let window = |id| WindowRec {
             id,
             app_name: "Test App".to_string(),
             bundle_id: "com.example.test".to_string(),
             title: format!("Window {id}"),
+            role: Some("AXWindow".to_string()),
+            subrole: Some("AXStandardWindow".to_string()),
             frame: Some(Frame {
                 x: 0,
                 y: 0,
@@ -267,7 +275,7 @@ mod tests {
         assert_eq!(decoded.east(1), Some(2));
         // Ops are deliberately not carried: a set off the wire is one nothing
         // has been asked of yet.
-        assert!(decoded.ops().is_empty());
+        assert_eq!(decoded.ops(), []);
     }
 
     #[test]
